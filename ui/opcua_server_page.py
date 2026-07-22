@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import copy
 import inspect
 import json
@@ -314,7 +315,10 @@ class OpcuaServerPage(ttk.Frame):
     def _normalize_server(self, source: dict[str, Any]) -> dict[str, Any]:
         server = copy.deepcopy(SERVER_DEFAULTS)
         server.update(copy.deepcopy(source))
-        server["enable"] = _bool(server.get("enable"), True)
+        server["enable"] = _bool(
+            server.get("enable", server.get("enabled")),
+            True,
+        )
         server["use_username"] = _bool(server.get("use_username"), False)
         server["name"] = str(server.get("name", "")).strip()
         server["endpoint_url"] = str(server.get("endpoint_url", "")).strip()
@@ -336,7 +340,11 @@ class OpcuaServerPage(ttk.Frame):
     def _normalize_node(source: dict[str, Any]) -> dict[str, Any]:
         node = copy.deepcopy(NODE_DEFAULTS)
         node.update(copy.deepcopy(source))
-        for key in ("enable", "subscribe", "writable", "db_enable"):
+        node["enable"] = _bool(
+            node.get("enable", node.get("enabled")),
+            NODE_DEFAULTS["enable"],
+        )
+        for key in ("subscribe", "writable", "db_enable"):
             node[key] = _bool(node.get(key), NODE_DEFAULTS[key])
         node["name"] = str(node.get("name", "")).strip()
         node["node_id"] = str(node.get("node_id", "")).strip()
@@ -562,14 +570,21 @@ class OpcuaServerPage(ttk.Frame):
             self._config = config
             reload_method = getattr(self.opcua_manager, "reload_config", None)
             if callable(reload_method):
-                result = reload_method()
-                if inspect.isawaitable(result):
-                    self._run_awaitable(result, "重新載入OPC UA設定")
-            self._refresh_app()
-            self.status_var.set("OPC UA設定已儲存")
-            self._log("OPC UA Server與Node設定已儲存。")
+                self.status_var.set("OPC UA設定已儲存，正在重新載入…")
+                self._run_awaitable(
+                    reload_method(),
+                    "重新載入OPC UA設定",
+                    success=self._save_done,
+                )
+                return
+            self._save_done()
         except Exception as exc:
             self._error("儲存OPC UA設定失敗", exc)
+
+    def _save_done(self) -> None:
+        self._refresh_app()
+        self.status_var.set("OPC UA設定已儲存")
+        self._log("OPC UA Server與Node設定已儲存。")
 
     def _put_servers(self, config: dict[str, Any], servers: list[dict[str, Any]]) -> None:
         if self._config_style == "opcua_servers":
@@ -668,23 +683,67 @@ class OpcuaServerPage(ttk.Frame):
 
         def worker() -> None:
             try:
-                result = method(*args)
-                if inspect.isawaitable(result):
-                    asyncio.run(result)
+                self._resolve_async_result(method(*args))
             except Exception as exc:
-                self.after(0, lambda error=exc: self._error(f"{action}失敗", error))
+                self._safe_after(lambda error=exc: self._error(f"{action}失敗", error))
                 return
-            self.after(0, lambda: self._manager_done(action, success))
+            self._safe_after(lambda: self._manager_done(action, success))
 
         threading.Thread(target=worker, name=f"OpcuaServerPage-{method_name}", daemon=True).start()
 
-    def _run_awaitable(self, awaitable: Any, action: str) -> None:
+    def _run_awaitable(
+        self,
+        result: Any,
+        action: str,
+        success: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """相容舊名稱，實際可處理concurrent Future與awaitable。"""
         def worker() -> None:
             try:
-                asyncio.run(awaitable)
+                self._resolve_async_result(result)
             except Exception as exc:
-                self.after(0, lambda error=exc: self._error(f"{action}失敗", error))
+                self._safe_after(lambda error=exc: self._error(f"{action}失敗", error))
+                return
+            if success:
+                self._safe_after(success)
+
         threading.Thread(target=worker, name="OpcuaServerPage-reload", daemon=True).start()
+
+    @staticmethod
+    def _resolve_async_result(result: Any) -> Any:
+        if isinstance(result, concurrent.futures.Future):
+            return result.result(timeout=30.0)
+
+        if inspect.iscoroutine(result):
+            return asyncio.run(result)
+
+        if isinstance(result, asyncio.Future):
+            if result.done():
+                return result.result()
+            loop = result.get_loop()
+            if loop.is_running():
+                async def wait_future() -> Any:
+                    return await result
+
+                return asyncio.run_coroutine_threadsafe(
+                    wait_future(),
+                    loop,
+                ).result(timeout=30.0)
+            return loop.run_until_complete(result)
+
+        if inspect.isawaitable(result):
+            async def wait_awaitable() -> Any:
+                return await result
+
+            return asyncio.run(wait_awaitable())
+
+        return result
+
+    def _safe_after(self, callback: Callable[[], None]) -> None:
+        try:
+            self.after(0, callback)
+        except (tk.TclError, RuntimeError):
+            pass
 
     def _manager_done(self, action: str, success: Optional[Callable[[], None]]) -> None:
         if success:
