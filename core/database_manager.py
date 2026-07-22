@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,11 @@ class DatabaseManager:
             except TypeError:
                 self.log_func(message)
 
+    @staticmethod
+    def _is_enabled(config: dict[str, Any]) -> bool:
+        """同時相容enable與enabled設定名稱。"""
+        return bool(config.get("enable", config.get("enabled", False)))
+
     def _config_snapshot(self) -> dict[str, Any]:
         getter = getattr(self.config_manager, "get_section", None)
         if callable(getter):
@@ -63,7 +69,10 @@ class DatabaseManager:
         try:
             import pymysql
         except ImportError as exc:
-            raise RuntimeError("尚未安裝pymysql，請執行pip install -r requirements.txt") from exc
+            raise RuntimeError(
+                "尚未安裝pymysql，請執行pip install -r requirements.txt"
+            ) from exc
+
         with self._lock:
             config = dict(self._config)
         database = str(config.get("database", "")).strip()
@@ -116,14 +125,30 @@ class DatabaseManager:
             return False, f"資料表建立失敗：{exc}"
 
     @staticmethod
-    def _db_timestamp(point_value: PointValue):
+    def _db_timestamp(point_value: PointValue) -> datetime:
+        """將PointValue時間轉成MySQL可接受的無時區datetime。"""
         timestamp = point_value.timestamp
+        if isinstance(timestamp, str):
+            text = timestamp.strip().replace("Z", "+00:00")
+            try:
+                timestamp = datetime.fromisoformat(text)
+            except ValueError:
+                timestamp = datetime.now()
+        elif not isinstance(timestamp, datetime):
+            timestamp = datetime.now()
+
         if timestamp.tzinfo is not None:
             timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
         return timestamp
 
     @staticmethod
+    def _json_text(value: Any) -> str:
+        """將原始值或設定轉成可儲存的JSON文字。"""
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+    @staticmethod
     def _parameters(point_value: PointValue) -> tuple[Any, ...]:
+        """參數順序與sql/create_tables.sql欄位一致。"""
         return (
             point_value.point_key,
             point_value.protocol,
@@ -131,20 +156,23 @@ class DatabaseManager:
             point_value.device_name,
             point_value.point_name,
             point_value.address_text,
+            DatabaseManager._json_text(point_value.value),
             point_value.value_text,
             point_value.value_number,
             point_value.status_text,
-            point_value.data_type,
-            1 if point_value.writable else 0,
             DatabaseManager._db_timestamp(point_value),
+            1 if point_value.writable else 0,
+            point_value.data_type,
+            DatabaseManager._json_text(point_value.raw_config),
         )
 
     def write_point_value(self, point_value: PointValue) -> bool:
         if not isinstance(point_value, PointValue):
             raise TypeError("write_point_value只接受PointValue")
+
         with self._lock:
             config = dict(self._config)
-        if not bool(config.get("enable", False)):
+        if not self._is_enabled(config):
             return False
 
         signature = (
@@ -159,33 +187,36 @@ class DatabaseManager:
                     return False
 
         params = self._parameters(point_value)
+        columns = (
+            "point_key,protocol,source_name,device_name,point_name,address_text,"
+            "value_json,value_text,value_number,status_text,point_timestamp,"
+            "writable,data_type,raw_config"
+        )
+        placeholders = ",".join(["%s"] * 14)
+
         connection = self._connect()
         try:
             with connection.cursor() as cursor:
                 if bool(config.get("write_history", True)):
                     cursor.execute(
-                        """
-                        INSERT INTO plc_point_history
-                        (point_key,protocol,source_name,device_name,point_name,address_text,
-                         value_text,value_number,status_text,data_type,writable,point_timestamp)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        """,
+                        f"INSERT INTO plc_point_history ({columns}) "
+                        f"VALUES ({placeholders})",
                         params,
                     )
                 if bool(config.get("write_latest", True)):
                     cursor.execute(
-                        """
-                        INSERT INTO plc_point_latest
-                        (point_key,protocol,source_name,device_name,point_name,address_text,
-                         value_text,value_number,status_text,data_type,writable,point_timestamp)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        f"""
+                        INSERT INTO plc_point_latest ({columns})
+                        VALUES ({placeholders})
                         ON DUPLICATE KEY UPDATE
                          protocol=VALUES(protocol),source_name=VALUES(source_name),
                          device_name=VALUES(device_name),point_name=VALUES(point_name),
-                         address_text=VALUES(address_text),value_text=VALUES(value_text),
-                         value_number=VALUES(value_number),status_text=VALUES(status_text),
-                         data_type=VALUES(data_type),writable=VALUES(writable),
-                         point_timestamp=VALUES(point_timestamp)
+                         address_text=VALUES(address_text),value_json=VALUES(value_json),
+                         value_text=VALUES(value_text),value_number=VALUES(value_number),
+                         status_text=VALUES(status_text),
+                         point_timestamp=VALUES(point_timestamp),
+                         writable=VALUES(writable),data_type=VALUES(data_type),
+                         raw_config=VALUES(raw_config)
                         """,
                         params,
                     )
@@ -222,7 +253,10 @@ class DatabaseManager:
             try:
                 self.write_point_value(point_value)
             except Exception as exc:
-                self._log(f"寫入點位「{point_value.point_key}」失敗：{exc}", "ERROR")
+                self._log(
+                    f"寫入點位「{point_value.point_key}」失敗：{exc}",
+                    "ERROR",
+                )
             finally:
                 self._queue.task_done()
 
@@ -230,7 +264,7 @@ class DatabaseManager:
         with self._lock:
             if self._auto_write_running:
                 return True, "自動上傳已在執行"
-            if not bool(self._config.get("enable", False)):
+            if not self._is_enabled(self._config):
                 return False, "config.json尚未啟用database.enable"
             self._stop_event.clear()
             self._auto_write_running = True
@@ -245,22 +279,32 @@ class DatabaseManager:
 
     def stop_auto_write(self):
         with self._lock:
+            self.value_bus.unsubscribe(self._enqueue_point)
             if not self._auto_write_running:
-                self.value_bus.unsubscribe(self._enqueue_point)
                 return True, "自動上傳已停止"
             self._auto_write_running = False
-            self.value_bus.unsubscribe(self._enqueue_point)
             self._stop_event.set()
             worker = self._worker
+
         if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=5.0)
+            worker.join(timeout=10.0)
+
+        worker_alive = bool(worker and worker.is_alive())
         with self._lock:
-            self._worker = None
+            self._worker = worker if worker_alive else None
+
+        if worker_alive:
+            self._log("資料庫背景寫入執行緒未在10秒內停止", "WARNING")
+            return False, "資料庫背景寫入執行緒停止逾時"
         return True, "自動上傳已停止"
 
     def is_auto_write_running(self) -> bool:
         with self._lock:
-            return bool(self._auto_write_running and self._worker and self._worker.is_alive())
+            return bool(
+                self._auto_write_running
+                and self._worker
+                and self._worker.is_alive()
+            )
 
     def is_auto_writing(self) -> bool:
         return self.is_auto_write_running()
