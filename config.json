@@ -24,12 +24,12 @@
     "devices": [
       {
         "enable": true,
-        "name": "範例PLC_1",
+        "name": "範例Modbus_PLC_1",
         "station_id": 1,
         "points": [
           {
             "enable": true,
-            "name": "運轉速度",
+            "name": "速度設定值",
             "type": "holding_register",
             "address": 0,
             "count": 1,
@@ -56,12 +56,22 @@
             "data_type": "Bool",
             "writable": true,
             "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "安全門狀態",
+            "type": "discrete_input",
+            "address": 0,
+            "count": 1,
+            "data_type": "Bool",
+            "writable": false,
+            "db_enable": true
           }
         ]
       },
       {
         "enable": true,
-        "name": "範例PLC_2",
+        "name": "範例Modbus_PLC_2",
         "station_id": 2,
         "points": [
           {
@@ -76,22 +86,32 @@
           },
           {
             "enable": true,
-            "name": "警報狀態",
-            "type": "discrete_input",
-            "address": 20,
-            "count": 1,
-            "data_type": "Bool",
+            "name": "實際壓力",
+            "type": "input_register",
+            "address": 110,
+            "count": 2,
+            "data_type": "Float32_ABCD",
             "writable": false,
             "db_enable": true
           },
           {
             "enable": true,
-            "name": "壓力設定值",
-            "type": "holding_register",
-            "address": 110,
-            "count": 2,
-            "data_type": "Float32_ABCD",
+            "name": "警報復歸",
+            "type": "coil",
+            "address": 20,
+            "count": 1,
+            "data_type": "Bool",
             "writable": true,
+            "db_enable": false
+          },
+          {
+            "enable": true,
+            "name": "警報輸入",
+            "type": "discrete_input",
+            "address": 20,
+            "count": 1,
+            "data_type": "Bool",
+            "writable": false,
             "db_enable": true
           }
         ]
@@ -128,6 +148,15 @@
             "writable": true,
             "data_type": "Float",
             "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "操作員訊息",
+            "node_id": "ns=2;s=Machine.OperatorMessage",
+            "subscribe": true,
+            "writable": true,
+            "data_type": "String",
+            "db_enable": false
           }
         ]
       },
@@ -148,6 +177,15 @@
             "subscribe": true,
             "writable": false,
             "data_type": "Double",
+            "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "生產數量",
+            "node_id": "ns=3;s=Process.ProductionCount",
+            "subscribe": true,
+            "writable": false,
+            "data_type": "UInt32",
             "db_enable": true
           },
           {
