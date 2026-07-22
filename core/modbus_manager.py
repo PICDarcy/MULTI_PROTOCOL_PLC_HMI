@@ -6,8 +6,9 @@ import math
 import struct
 import threading
 import time
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any
 
 from .data_model import PointValue, make_modbus_point_key
 
@@ -15,7 +16,13 @@ PROTOCOL_MODBUS = "MODBUS_RTU"
 
 
 class ModbusRtuManager:
-    """使用單一序列埠輪詢多個Modbus RTU站號。"""
+    """使用單一序列埠輪詢多個Modbus RTU站號。
+
+    修正重點：
+    - 所有Modbus讀取、寫入、寫入後read-back與close都使用同一把_io_lock。
+    - stop_polling逾時時保留舊thread引用，避免再次啟動第二個輪詢thread。
+    - 輪詢迴圈在stop_event被設定後盡快中止，降低關閉卡住機率。
+    """
 
     def __init__(self, config_manager, value_bus, log_func=None):
         self.config_manager = config_manager
@@ -36,6 +43,22 @@ class ModbusRtuManager:
                 self.log_func(message, level)
             except TypeError:
                 self.log_func(message)
+
+    @staticmethod
+    def _as_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"1", "true", "yes", "y", "on", "是", "啟用"}:
+                return True
+            if text in {"0", "false", "no", "n", "off", "否", "停用"}:
+                return False
+        return bool(value)
 
     def _config_snapshot(self) -> dict[str, Any]:
         getter = getattr(self.config_manager, "get_section", None)
@@ -67,7 +90,10 @@ class ModbusRtuManager:
     def reload_config(self):
         was_running = self.is_running()
         if was_running:
-            self.stop_polling()
+            stop_result = self.stop_polling()
+            if isinstance(stop_result, str) and "逾時" in stop_result:
+                raise RuntimeError("Modbus輪詢尚未安全停止，無法重新載入設定。")
+
         with self._state_lock:
             self._config = self._config_snapshot()
             self._points.clear()
@@ -80,7 +106,8 @@ class ModbusRtuManager:
                         if key in self._points:
                             raise ValueError(f"Modbus point_key重複：{key}")
                         self._points[key] = (dict(device), dict(point))
-        if was_running and bool(self._config.get("enable", False)):
+
+        if was_running and self._as_bool(self._config.get("enable", self._config.get("enabled")), False):
             self.start_polling()
         return {"point_count": len(self._points), "running": self.is_running()}
 
@@ -89,6 +116,7 @@ class ModbusRtuManager:
             from pymodbus.client import ModbusSerialClient
         except ImportError as exc:
             raise RuntimeError("尚未安裝pymodbus，請執行pip install -r requirements.txt") from exc
+
         config = self._config
         return ModbusSerialClient(
             port=str(config.get("port", "COM1")),
@@ -99,14 +127,17 @@ class ModbusRtuManager:
             timeout=float(config.get("timeout", 1.0)),
         )
 
+    def _ensure_client_unlocked(self):
+        if self._client is None:
+            self._client = self._make_client()
+        connected = self._client.connect()
+        if connected is False:
+            raise ConnectionError(f"無法開啟Modbus序列埠：{self._config.get('port', '')}")
+        return self._client
+
     def _ensure_client(self):
         with self._io_lock:
-            if self._client is None:
-                self._client = self._make_client()
-            connected = self._client.connect()
-            if connected is False:
-                raise ConnectionError(f"無法開啟Modbus序列埠：{self._config.get('port', '')}")
-            return self._client
+            return self._ensure_client_unlocked()
 
     def _close_client(self) -> None:
         with self._io_lock:
@@ -114,8 +145,8 @@ class ModbusRtuManager:
             if client is not None:
                 try:
                     client.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._log(f"關閉Modbus序列埠時發生錯誤：{exc}", "WARNING")
 
     @staticmethod
     def _call_unit(method, station_id: int, **kwargs):
@@ -137,7 +168,7 @@ class ModbusRtuManager:
         if callable(checker) and checker():
             raise RuntimeError(str(response))
 
-    def _read_raw(self, client, device: Mapping[str, Any], point: Mapping[str, Any]):
+    def _read_raw_unlocked(self, client, device: Mapping[str, Any], point: Mapping[str, Any]):
         station = int(device.get("station_id", 1))
         address = int(point.get("address", 0))
         count = max(1, int(point.get("count", 1)))
@@ -157,6 +188,10 @@ class ModbusRtuManager:
         if point_type in {"coil", "discrete_input"}:
             return list(getattr(response, "bits", []))[:count]
         return list(getattr(response, "registers", []))[:count]
+
+    def _read_raw(self, client, device: Mapping[str, Any], point: Mapping[str, Any]):
+        with self._io_lock:
+            return self._read_raw_unlocked(client, device, point)
 
     @staticmethod
     def _ordered_bytes(registers: list[int], data_type: str) -> bytes:
@@ -247,7 +282,7 @@ class ModbusRtuManager:
             value_number=self._value_number(value),
             status_text=status,
             timestamp=datetime.now(),
-            writable=bool(point.get("writable", False)),
+            writable=self._as_bool(point.get("writable", False), False),
             data_type=str(point.get("data_type", "Auto")),
             raw_config=raw_config,
         )
@@ -255,19 +290,25 @@ class ModbusRtuManager:
         return point_value
 
     def read_all_once(self):
-        client = self._ensure_client()
         success = 0
         failed = 0
         with self._state_lock:
             devices = list(self._config.get("devices", []))
+
         for device in devices:
-            if not isinstance(device, Mapping) or not bool(device.get("enable", True)):
+            if self._stop_event.is_set():
+                break
+            if not isinstance(device, Mapping) or not self._as_bool(device.get("enable", True), True):
                 continue
             for point in device.get("points", []):
-                if not isinstance(point, Mapping) or not bool(point.get("enable", True)):
+                if self._stop_event.is_set():
+                    break
+                if not isinstance(point, Mapping) or not self._as_bool(point.get("enable", True), True):
                     continue
                 try:
-                    raw = self._read_raw(client, device, point)
+                    with self._io_lock:
+                        client = self._ensure_client_unlocked()
+                        raw = self._read_raw_unlocked(client, device, point)
                     value = self._decode(
                         raw,
                         str(point.get("data_type", "Auto")),
@@ -279,25 +320,37 @@ class ModbusRtuManager:
                     self._publish(device, point, None, f"讀取失敗：{exc}")
                     self._log(f"Modbus點位「{point.get('name', '')}」讀取失敗：{exc}", "ERROR")
                     failed += 1
+
         return {"success": success, "failed": failed, "total": success + failed}
 
     def _poll_loop(self) -> None:
         interval = max(0.05, float(self._config.get("poll_interval", 1.0)))
-        while not self._stop_event.is_set():
-            started = time.monotonic()
-            try:
-                self.read_all_once()
-            except Exception as exc:
-                self._log(f"Modbus輪詢失敗：{exc}", "ERROR")
-                self._close_client()
-            self._stop_event.wait(max(0.0, interval - (time.monotonic() - started)))
-        self._close_client()
+        try:
+            while not self._stop_event.is_set():
+                started = time.monotonic()
+                try:
+                    self.read_all_once()
+                except Exception as exc:
+                    self._log(f"Modbus輪詢失敗：{exc}", "ERROR")
+                    self._close_client()
+                wait_time = max(0.0, interval - (time.monotonic() - started))
+                self._stop_event.wait(wait_time)
+        finally:
+            self._close_client()
+            with self._state_lock:
+                current = threading.current_thread()
+                if self._thread is current:
+                    self._thread = None
 
     def start_polling(self):
         with self._state_lock:
-            if self.is_running():
+            if self._thread and self._thread.is_alive():
+                if self._stop_event.is_set():
+                    return "Modbus輪詢正在停止，請稍後再啟動"
                 return "Modbus輪詢已在執行"
-            if not bool(self._config.get("enable", False)):
+
+            self._thread = None
+            if not self._as_bool(self._config.get("enable", self._config.get("enabled")), False):
                 raise RuntimeError("config.json尚未啟用modbus_rtu.enable")
             self._stop_event.clear()
             self._thread = threading.Thread(
@@ -312,11 +365,19 @@ class ModbusRtuManager:
         self._stop_event.set()
         with self._state_lock:
             thread = self._thread
+
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=max(2.0, float(self._config.get("timeout", 1.0)) + 1.0))
+            timeout = max(3.0, float(self._config.get("timeout", 1.0)) + 2.0)
+            thread.join(timeout=timeout)
+
+        if thread is not None and thread.is_alive():
+            self._log("Modbus輪詢執行緒停止逾時，保留執行緒引用並禁止再次啟動。", "WARNING")
+            return "Modbus輪詢停止逾時，請稍後再確認狀態"
+
         self._close_client()
         with self._state_lock:
-            self._thread = None
+            if self._thread is thread:
+                self._thread = None
         return "Modbus輪詢已停止"
 
     def is_running(self) -> bool:
@@ -331,6 +392,8 @@ class ModbusRtuManager:
             registers = [int(str(value_text).strip(), 0)]
         elif base == "INT16":
             registers = list(struct.unpack(">H", struct.pack(">h", int(value_text))))
+        elif base in {"BOOL", "BOOLEAN"}:
+            registers = [1 if cls._parse_bool(value_text) else 0]
         else:
             formats = {
                 "UINT32": ">I",
@@ -358,60 +421,77 @@ class ModbusRtuManager:
                 struct.unpack(">H", raw[index : index + 2])[0]
                 for index in range(0, len(raw), 2)
             ]
+
         if len(registers) > count:
             raise ValueError(f"寫入值需要{len(registers)}個Register，但設定count只有{count}")
-        return registers
+        return registers + [0] * max(0, count - len(registers))
+
+    @staticmethod
+    def _parse_bool(value_text: Any) -> bool:
+        if isinstance(value_text, bool):
+            return value_text
+        text = str(value_text).strip().lower()
+        if text in {"1", "true", "yes", "y", "on", "是"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", "否"}:
+            return False
+        return bool(int(text, 0))
+
+    def _write_registers_unlocked(
+        self,
+        client,
+        station: int,
+        address: int,
+        registers: list[int],
+    ):
+        if len(registers) == 1:
+            method = getattr(client, "write_register")
+            return self._call_unit(method, station, address=address, value=registers[0])
+        method = getattr(client, "write_registers")
+        return self._call_unit(method, station, address=address, values=registers)
+
+    def _write_coil_unlocked(self, client, station: int, address: int, value: bool):
+        method = getattr(client, "write_coil")
+        return self._call_unit(method, station, address=address, value=value)
 
     def write_point(self, point_key, value_text):
         with self._state_lock:
-            target = self._points.get(str(point_key))
-        if target is None:
+            item = self._points.get(str(point_key))
+        if item is None:
             raise KeyError(f"找不到Modbus點位：{point_key}")
-        device, point = target
-        if not bool(point.get("writable", False)):
-            raise PermissionError(f"點位「{point.get('name', '')}」不可寫入")
-        point_type = str(point.get("type", "")).lower()
-        if point_type not in {"coil", "holding_register"}:
-            raise PermissionError(f"{point_type}是唯讀點位")
-        client = self._ensure_client()
+
+        device, point = item
+        if not self._as_bool(point.get("writable", False), False):
+            raise PermissionError(f"Modbus點位不可寫入：{point.get('name', point_key)}")
+
+        point_type = str(point.get("type", "holding_register")).lower()
+        if point_type not in {"holding_register", "coil"}:
+            raise ValueError(f"{point_type}不支援寫入，僅holding_register與coil可寫入")
+
         station = int(device.get("station_id", 1))
         address = int(point.get("address", 0))
+        count = max(1, int(point.get("count", 1)))
+
         with self._io_lock:
+            client = self._ensure_client_unlocked()
             if point_type == "coil":
-                text = str(value_text).strip().lower()
-                if text in {"1", "true", "on", "yes", "是", "開"}:
-                    value = True
-                elif text in {"0", "false", "off", "no", "否", "關"}:
-                    value = False
-                else:
-                    raise ValueError("Bool寫入值請使用true/false或1/0")
-                response = self._call_unit(
-                    client.write_coil,
+                response = self._write_coil_unlocked(
+                    client,
                     station,
-                    address=address,
-                    value=value,
+                    address,
+                    self._parse_bool(value_text),
                 )
             else:
                 registers = self._encode_registers(
                     value_text,
                     str(point.get("data_type", "UInt16")),
-                    max(1, int(point.get("count", 1))),
+                    count,
                 )
-                if len(registers) == 1 and hasattr(client, "write_register"):
-                    response = self._call_unit(
-                        client.write_register,
-                        station,
-                        address=address,
-                        value=registers[0],
-                    )
-                else:
-                    response = self._call_unit(
-                        client.write_registers,
-                        station,
-                        address=address,
-                        values=registers,
-                    )
+                response = self._write_registers_unlocked(client, station, address, registers)
             self._response_error(response)
-        raw = self._read_raw(client, device, point)
+
+            raw = self._read_raw_unlocked(client, device, point)
+
         value = self._decode(raw, str(point.get("data_type", "Auto")), point_type)
-        return self._publish(device, point, value, "寫入成功")
+        self._publish(device, point, value, "WriteGood")
+        return True
