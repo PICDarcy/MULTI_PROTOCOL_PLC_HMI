@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
 import threading
 import tkinter as tk
@@ -240,9 +241,14 @@ class OverviewPage(ttk.Frame):
 
         def worker() -> None:
             try:
-                result = action()
-                if inspect.isawaitable(result):
-                    asyncio.run(result)
+                result = self._resolve_async_result(action())
+                if (
+                    isinstance(result, tuple)
+                    and result
+                    and result[0] is False
+                ):
+                    detail = result[1] if len(result) > 1 else "操作失敗"
+                    raise RuntimeError(str(detail))
                 self._write_log("INFO", f"執行完成：{action_name}")
             except Exception as exc:
                 self._write_log(
@@ -252,7 +258,7 @@ class OverviewPage(ttk.Frame):
             finally:
                 try:
                     self.after(0, self._finish_action)
-                except tk.TclError:
+                except (tk.TclError, RuntimeError):
                     pass
 
         threading.Thread(
@@ -260,6 +266,37 @@ class OverviewPage(ttk.Frame):
             name=f"OverviewAction-{action_name}",
             daemon=True,
         ).start()
+
+    @staticmethod
+    def _resolve_async_result(result: Any) -> Any:
+        """等待concurrent Future或awaitable完成並回傳實際結果。"""
+        if isinstance(result, concurrent.futures.Future):
+            return result.result(timeout=30.0)
+
+        if inspect.iscoroutine(result):
+            return asyncio.run(result)
+
+        if isinstance(result, asyncio.Future):
+            if result.done():
+                return result.result()
+            loop = result.get_loop()
+            if loop.is_running():
+                async def wait_future() -> Any:
+                    return await result
+
+                return asyncio.run_coroutine_threadsafe(
+                    wait_future(),
+                    loop,
+                ).result(timeout=30.0)
+            return loop.run_until_complete(result)
+
+        if inspect.isawaitable(result):
+            async def wait_awaitable() -> Any:
+                return await result
+
+            return asyncio.run(wait_awaitable())
+
+        return result
 
     def _finish_action(self) -> None:
         self._action_running = False
@@ -288,7 +325,7 @@ class OverviewPage(ttk.Frame):
             return section
 
         if isinstance(section, Mapping):
-            for key in ("enabled", "enable", "is_enabled", "active"):
+            for key in ("enable", "enabled", "is_enabled", "active"):
                 if key in section:
                     return self._to_bool(section[key])
 
