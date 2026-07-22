@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,13 @@ from .data_model import PointValue
 
 
 class DatabaseManager:
-    """接收PointValue並寫入歷史表及最新值表。"""
+    """接收PointValue並寫入歷史表及最新值表。
+
+    修正重點：
+    - 背景worker停止時最多清空queue一段可設定時間，避免程式關閉無限等待。
+    - 停止逾時時保留worker引用，start_auto_write會拒絕建立第二個worker。
+    - 所有寫入入口都會檢查database.enable與point.raw_config.db_enable。
+    """
 
     def __init__(self, config_manager, value_bus, log_func=None):
         self.config_manager = config_manager
@@ -40,9 +47,29 @@ class DatabaseManager:
                 self.log_func(message)
 
     @staticmethod
-    def _is_enabled(config: dict[str, Any]) -> bool:
-        """同時相容enable與enabled設定名稱。"""
-        return bool(config.get("enable", config.get("enabled", False)))
+    def _as_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"1", "true", "yes", "y", "on", "是", "啟用"}:
+                return True
+            if text in {"0", "false", "no", "n", "off", "否", "停用"}:
+                return False
+        return bool(value)
+
+    @classmethod
+    def _is_enabled(cls, config: dict[str, Any]) -> bool:
+        return cls._as_bool(config.get("enable", config.get("enabled")), False)
+
+    @classmethod
+    def _point_db_enabled(cls, point_value: PointValue) -> bool:
+        raw_config = point_value.raw_config if isinstance(point_value.raw_config, dict) else {}
+        return cls._as_bool(raw_config.get("db_enable", True), True)
 
     def _config_snapshot(self) -> dict[str, Any]:
         getter = getattr(self.config_manager, "get_section", None)
@@ -86,6 +113,8 @@ class DatabaseManager:
             database=database,
             charset=str(config.get("charset", "utf8mb4")),
             connect_timeout=max(1, int(float(config.get("connect_timeout", 5)))),
+            read_timeout=max(1, int(float(config.get("read_timeout", config.get("connect_timeout", 5))))),
+            write_timeout=max(1, int(float(config.get("write_timeout", config.get("connect_timeout", 5))))),
             autocommit=False,
         )
 
@@ -126,7 +155,6 @@ class DatabaseManager:
 
     @staticmethod
     def _db_timestamp(point_value: PointValue) -> datetime:
-        """將PointValue時間轉成MySQL可接受的無時區datetime。"""
         timestamp = point_value.timestamp
         if isinstance(timestamp, str):
             text = timestamp.strip().replace("Z", "+00:00")
@@ -143,12 +171,10 @@ class DatabaseManager:
 
     @staticmethod
     def _json_text(value: Any) -> str:
-        """將原始值或設定轉成可儲存的JSON文字。"""
         return json.dumps(value, ensure_ascii=False, default=str)
 
     @staticmethod
     def _parameters(point_value: PointValue) -> tuple[Any, ...]:
-        """參數順序與sql/create_tables.sql欄位一致。"""
         return (
             point_value.point_key,
             point_value.protocol,
@@ -174,6 +200,8 @@ class DatabaseManager:
             config = dict(self._config)
         if not self._is_enabled(config):
             return False
+        if not self._point_db_enabled(point_value):
+            return False
 
         signature = (
             point_value.value_text,
@@ -181,7 +209,7 @@ class DatabaseManager:
             point_value.status_text,
             point_value.data_type,
         )
-        if bool(config.get("write_only_on_change", True)):
+        if self._as_bool(config.get("write_only_on_change", True), True):
             with self._lock:
                 if self._last_signature.get(point_value.point_key) == signature:
                     return False
@@ -197,13 +225,13 @@ class DatabaseManager:
         connection = self._connect()
         try:
             with connection.cursor() as cursor:
-                if bool(config.get("write_history", True)):
+                if self._as_bool(config.get("write_history", True), True):
                     cursor.execute(
                         f"INSERT INTO plc_point_history ({columns}) "
                         f"VALUES ({placeholders})",
                         params,
                     )
-                if bool(config.get("write_latest", True)):
+                if self._as_bool(config.get("write_latest", True), True):
                     cursor.execute(
                         f"""
                         INSERT INTO plc_point_latest ({columns})
@@ -234,38 +262,83 @@ class DatabaseManager:
     def _enqueue_point(self, point_value: PointValue) -> None:
         if not isinstance(point_value, PointValue):
             return
-        if point_value.raw_config.get("db_enable", True) is False:
+        if not self._point_db_enabled(point_value):
             return
         try:
             self._queue.put_nowait(point_value)
         except queue.Full:
             self._log("資料庫寫入佇列已滿，略過一筆點位資料", "WARNING")
 
-    def _worker_loop(self) -> None:
-        while not self._stop_event.is_set() or not self._queue.empty():
+    def _queue_get_with_stop(self, timeout: float = 0.2):
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def _discard_remaining_queue(self) -> int:
+        count = 0
+        while True:
             try:
-                point_value = self._queue.get(timeout=0.2)
+                item = self._queue.get_nowait()
             except queue.Empty:
-                continue
-            if point_value is None:
-                self._queue.task_done()
-                continue
+                break
             try:
-                self.write_point_value(point_value)
-            except Exception as exc:
-                self._log(
-                    f"寫入點位「{point_value.point_key}」失敗：{exc}",
-                    "ERROR",
-                )
-            finally:
                 self._queue.task_done()
+            except ValueError:
+                pass
+            if item is not None:
+                count += 1
+        return count
+
+    def _worker_loop(self) -> None:
+        drain_deadline: float | None = None
+        try:
+            while True:
+                if self._stop_event.is_set():
+                    if drain_deadline is None:
+                        with self._lock:
+                            config = dict(self._config)
+                        drain_seconds = max(
+                            0.0,
+                            float(config.get("stop_drain_timeout", 5.0)),
+                        )
+                        drain_deadline = time.monotonic() + drain_seconds
+                    if self._queue.empty():
+                        break
+                    if time.monotonic() > drain_deadline:
+                        dropped = self._discard_remaining_queue()
+                        if dropped:
+                            self._log(
+                                f"資料庫背景寫入停止逾時，已略過佇列中{dropped}筆未寫入資料",
+                                "WARNING",
+                            )
+                        break
+
+                point_value = self._queue_get_with_stop(timeout=0.2)
+                if point_value is None:
+                    continue
+
+                try:
+                    self.write_point_value(point_value)
+                except Exception as exc:
+                    self._log(f"寫入點位「{point_value.point_key}」失敗：{exc}", "ERROR")
+                finally:
+                    self._queue.task_done()
+        finally:
+            with self._lock:
+                if self._worker is threading.current_thread():
+                    self._worker = None
+                self._auto_write_running = False
 
     def start_auto_write(self):
         with self._lock:
+            if self._worker and self._worker.is_alive():
+                return False, "資料庫背景寫入執行緒仍在停止中，請稍後再啟動"
             if self._auto_write_running:
                 return True, "自動上傳已在執行"
             if not self._is_enabled(self._config):
                 return False, "config.json尚未啟用database.enable"
+
             self._stop_event.clear()
             self._auto_write_running = True
             self.value_bus.subscribe(self._enqueue_point)
@@ -279,14 +352,19 @@ class DatabaseManager:
 
     def stop_auto_write(self):
         with self._lock:
-            self.value_bus.unsubscribe(self._enqueue_point)
-            if not self._auto_write_running:
+            try:
+                self.value_bus.unsubscribe(self._enqueue_point)
+            except Exception as exc:
+                self._log(f"取消資料庫自動上傳訂閱失敗：{exc}", "WARNING")
+            worker = self._worker
+            if worker is None or not worker.is_alive():
+                self._auto_write_running = False
+                self._worker = None
                 return True, "自動上傳已停止"
             self._auto_write_running = False
             self._stop_event.set()
-            worker = self._worker
 
-        if worker is not None and worker is not threading.current_thread():
+        if worker is not threading.current_thread():
             worker.join(timeout=10.0)
 
         worker_alive = bool(worker and worker.is_alive())
@@ -294,17 +372,13 @@ class DatabaseManager:
             self._worker = worker if worker_alive else None
 
         if worker_alive:
-            self._log("資料庫背景寫入執行緒未在10秒內停止", "WARNING")
+            self._log("資料庫背景寫入執行緒未在10秒內停止，將禁止建立第二個worker。", "WARNING")
             return False, "資料庫背景寫入執行緒停止逾時"
         return True, "自動上傳已停止"
 
     def is_auto_write_running(self) -> bool:
         with self._lock:
-            return bool(
-                self._auto_write_running
-                and self._worker
-                and self._worker.is_alive()
-            )
+            return bool(self._worker and self._worker.is_alive())
 
     def is_auto_writing(self) -> bool:
         return self.is_auto_write_running()
