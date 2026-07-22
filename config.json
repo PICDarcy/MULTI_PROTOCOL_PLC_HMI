@@ -1,0 +1,166 @@
+{
+  "database": {
+    "enable": false,
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "root",
+    "password": "",
+    "database": "plc_hmi",
+    "charset": "utf8mb4",
+    "connect_timeout": 5,
+    "write_history": true,
+    "write_latest": true,
+    "write_only_on_change": true
+  },
+  "modbus_rtu": {
+    "enable": false,
+    "port": "COM3",
+    "baudrate": 9600,
+    "bytesize": 8,
+    "parity": "N",
+    "stopbits": 1,
+    "timeout": 1.0,
+    "poll_interval": 1.0,
+    "devices": [
+      {
+        "enable": true,
+        "name": "範例PLC_1",
+        "station_id": 1,
+        "points": [
+          {
+            "enable": true,
+            "name": "運轉速度",
+            "type": "holding_register",
+            "address": 0,
+            "count": 1,
+            "data_type": "UInt16",
+            "writable": true,
+            "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "實際溫度",
+            "type": "input_register",
+            "address": 10,
+            "count": 2,
+            "data_type": "Float32_ABCD",
+            "writable": false,
+            "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "啟動命令",
+            "type": "coil",
+            "address": 0,
+            "count": 1,
+            "data_type": "Bool",
+            "writable": true,
+            "db_enable": true
+          }
+        ]
+      },
+      {
+        "enable": true,
+        "name": "範例PLC_2",
+        "station_id": 2,
+        "points": [
+          {
+            "enable": true,
+            "name": "生產計數",
+            "type": "holding_register",
+            "address": 100,
+            "count": 2,
+            "data_type": "UInt32_ABCD",
+            "writable": true,
+            "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "警報狀態",
+            "type": "discrete_input",
+            "address": 20,
+            "count": 1,
+            "data_type": "Bool",
+            "writable": false,
+            "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "壓力設定值",
+            "type": "holding_register",
+            "address": 110,
+            "count": 2,
+            "data_type": "Float32_ABCD",
+            "writable": true,
+            "db_enable": true
+          }
+        ]
+      }
+    ]
+  },
+  "opcua": {
+    "enable": false,
+    "servers": [
+      {
+        "enable": true,
+        "name": "範例OPCUA_Server_1",
+        "endpoint_url": "opc.tcp://127.0.0.1:4840",
+        "use_username": false,
+        "username": "",
+        "password": "",
+        "timeout": 5.0,
+        "subscription_interval_ms": 500,
+        "nodes": [
+          {
+            "enable": true,
+            "name": "機台運轉狀態",
+            "node_id": "ns=2;s=Machine.Running",
+            "subscribe": true,
+            "writable": false,
+            "data_type": "Boolean",
+            "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "速度設定值",
+            "node_id": "ns=2;s=Machine.SpeedSetpoint",
+            "subscribe": true,
+            "writable": true,
+            "data_type": "Float",
+            "db_enable": true
+          }
+        ]
+      },
+      {
+        "enable": true,
+        "name": "範例OPCUA_Server_2",
+        "endpoint_url": "opc.tcp://192.168.1.20:4840",
+        "use_username": true,
+        "username": "operator",
+        "password": "",
+        "timeout": 5.0,
+        "subscription_interval_ms": 1000,
+        "nodes": [
+          {
+            "enable": true,
+            "name": "實際溫度",
+            "node_id": "ns=3;s=Process.ActualTemperature",
+            "subscribe": true,
+            "writable": false,
+            "data_type": "Double",
+            "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "重置命令",
+            "node_id": "ns=3;s=Command.Reset",
+            "subscribe": false,
+            "writable": true,
+            "data_type": "Boolean",
+            "db_enable": false
+          }
+        ]
+      }
+    ]
+  }
+}
