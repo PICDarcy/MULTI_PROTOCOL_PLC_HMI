@@ -30,6 +30,8 @@ DEFAULT_SUBSCRIPTION_INTERVAL_MS = 500.0
 
 WRITE_TYPES = {
     "BOOLEAN": ua.VariantType.Boolean,
+    "BYTE": ua.VariantType.Byte,
+    "SBYTE": ua.VariantType.SByte,
     "INT16": ua.VariantType.Int16,
     "INT32": ua.VariantType.Int32,
     "INT64": ua.VariantType.Int64,
@@ -39,9 +41,12 @@ WRITE_TYPES = {
     "FLOAT": ua.VariantType.Float,
     "DOUBLE": ua.VariantType.Double,
     "STRING": ua.VariantType.String,
+    "DATETIME": ua.VariantType.DateTime,
 }
 
 INTEGER_LIMITS = {
+    ua.VariantType.SByte: (-(2**7), 2**7 - 1),
+    ua.VariantType.Byte: (0, 2**8 - 1),
     ua.VariantType.Int16: (-(2**15), 2**15 - 1),
     ua.VariantType.Int32: (-(2**31), 2**31 - 1),
     ua.VariantType.Int64: (-(2**63), 2**63 - 1),
@@ -80,10 +85,15 @@ class _ServerSubscriptionHandler:
         )
 
     async def event_notification(self, event):
-        self.manager._log(f"Server「{self.server_name}」收到事件通知：{event}", "DEBUG")
+        self.manager._log(
+            f"Server「{self.server_name}」收到事件通知：{event}",
+            "DEBUG",
+        )
 
 
 class OpcuaMultiServerManager:
+    """在單一背景asyncio事件迴圈管理多台OPC UA Server。"""
+
     def __init__(self, config_manager, value_bus, log_callback=None):
         self.config_manager = config_manager
         self.value_bus = value_bus
@@ -108,7 +118,6 @@ class OpcuaMultiServerManager:
         self._connected: dict[str, bool] = {}
         self._operation_locks: dict[str, asyncio.Lock] = {}
 
-        # 保留最新資料及狀態，供UI或其他模組隨時讀取。
         self.latest_values: dict[str, PointValue] = {}
         self.latest_status: dict[str, dict[str, Any]] = {}
         self.latest_point_status: dict[str, dict[str, Any]] = {}
@@ -122,7 +131,7 @@ class OpcuaMultiServerManager:
             raise RuntimeError("OPC UA背景事件迴圈啟動逾時")
 
     # ------------------------------------------------------------------
-    # 對外公開介面：全部網路操作均回傳concurrent.futures.Future
+    # 公開介面：網路操作回傳concurrent.futures.Future
     # ------------------------------------------------------------------
     def connect_server(self, server_name):
         return self._submit(self._connect_server(str(server_name)))
@@ -153,7 +162,9 @@ class OpcuaMultiServerManager:
         return self._submit(self._subscribe_node(str(server_name), node_config))
 
     def unsubscribe_node(self, server_name, node_id):
-        return self._submit(self._unsubscribe_node(str(server_name), str(node_id)))
+        return self._submit(
+            self._unsubscribe_node(str(server_name), str(node_id))
+        )
 
     def subscribe_all(self):
         return self._submit(self._subscribe_all())
@@ -205,17 +216,53 @@ class OpcuaMultiServerManager:
             return bool(self._connected.get(server_name, False))
 
     def shutdown(self):
-        """斷開全部Server，完成後停止背景事件迴圈。"""
-        future = self.disconnect_all()
+        """斷開全部Server，停止事件迴圈並等待背景執行緒結束。"""
+        with self._state_lock:
+            if self._closed:
+                completed: concurrent.futures.Future = concurrent.futures.Future()
+                completed.set_result({})
+                return completed
 
-        def stop_loop(_future):
+        disconnect_future = self.disconnect_all()
+        completion: concurrent.futures.Future = concurrent.futures.Future()
+
+        def stop_loop(done_future: concurrent.futures.Future) -> None:
+            try:
+                result = done_future.result()
+                failure: BaseException | None = None
+            except BaseException as exc:  # noqa: BLE001
+                result = None
+                failure = exc
+
             with self._state_lock:
                 self._closed = True
-            if self._loop is not None:
-                self._loop.call_soon_threadsafe(self._loop.stop)
+                loop = self._loop
+            if loop is not None:
+                try:
+                    loop.call_soon_threadsafe(loop.stop)
+                except RuntimeError:
+                    pass
 
-        future.add_done_callback(stop_loop)
-        return future
+            def wait_loop_thread() -> None:
+                if self._loop_thread is not threading.current_thread():
+                    self._loop_thread.join(timeout=5.0)
+                if self._loop_thread.is_alive():
+                    completion.set_exception(
+                        RuntimeError("OPC UA背景事件迴圈未在5秒內停止")
+                    )
+                elif failure is not None:
+                    completion.set_exception(failure)
+                else:
+                    completion.set_result(result)
+
+            threading.Thread(
+                target=wait_loop_thread,
+                name="OpcuaShutdownWaiter",
+                daemon=True,
+            ).start()
+
+        disconnect_future.add_done_callback(stop_loop)
+        return completion
 
     # ------------------------------------------------------------------
     # 背景asyncio事件迴圈
@@ -232,10 +279,15 @@ class OpcuaMultiServerManager:
             for task in pending:
                 task.cancel()
             if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
             loop.close()
 
-    def _submit(self, coroutine: Coroutine[Any, Any, Any]) -> concurrent.futures.Future:
+    def _submit(
+        self,
+        coroutine: Coroutine[Any, Any, Any],
+    ) -> concurrent.futures.Future:
         with self._state_lock:
             if self._closed or self._loop is None or not self._loop.is_running():
                 coroutine.close()
@@ -261,25 +313,49 @@ class OpcuaMultiServerManager:
             if self.is_connected(server_name) and server_name in self._clients:
                 return {
                     "server_name": server_name,
-                    "endpoint_url": self._safe_endpoint(config.get("endpoint_url")),
+                    "endpoint_url": self._safe_endpoint(
+                        config.get("endpoint_url")
+                    ),
                     "connected": True,
                     "status_text": "已連線",
                 }
 
             endpoint_url = str(config.get("endpoint_url", "")).strip()
             if not endpoint_url:
-                raise ValueError(f"Server「{server_name}」未設定endpoint_url")
+                raise ValueError(
+                    f"Server「{server_name}」未設定endpoint_url"
+                )
 
             timeout = self._to_float(
-                config.get("timeout_seconds", config.get("timeout", DEFAULT_TIMEOUT_SECONDS)),
+                config.get(
+                    "timeout_seconds",
+                    config.get("timeout", DEFAULT_TIMEOUT_SECONDS),
+                ),
                 DEFAULT_TIMEOUT_SECONDS,
                 minimum=0.1,
             )
             client = Client(endpoint_url, timeout=timeout)
-            auth = config.get("auth") if isinstance(config.get("auth"), Mapping) else {}
-            username = str(config.get("username", auth.get("username", "")) or "")
-            password = str(config.get("password", auth.get("password", "")) or "")
-            if username:
+
+            auth = (
+                config.get("auth")
+                if isinstance(config.get("auth"), Mapping)
+                else {}
+            )
+            username = str(
+                config.get("username", auth.get("username", "")) or ""
+            )
+            password = str(
+                config.get("password", auth.get("password", "")) or ""
+            )
+            use_username = self._to_bool(
+                config.get("use_username", bool(username)),
+                bool(username),
+            )
+            if use_username:
+                if not username:
+                    raise ValueError(
+                        f"Server「{server_name}」已啟用帳號登入但username為空白"
+                    )
                 client.set_user(username)
                 client.set_password(password)
 
@@ -292,8 +368,16 @@ class OpcuaMultiServerManager:
                 except Exception:
                     pass
                 error_text = self._redact_error(config, exc)
-                self._set_server_status(server_name, False, f"連線失敗：{error_text}", error_text)
-                self._log(f"Server「{server_name}」連線失敗：{error_text}", "ERROR")
+                self._set_server_status(
+                    server_name,
+                    False,
+                    f"連線失敗：{error_text}",
+                    error_text,
+                )
+                self._log(
+                    f"Server「{server_name}」連線失敗：{error_text}",
+                    "ERROR",
+                )
                 raise
 
             with self._state_lock:
@@ -303,7 +387,8 @@ class OpcuaMultiServerManager:
                 self._node_configs.setdefault(server_name, {})
             self._set_server_status(server_name, True, "已連線")
             self._log(
-                f"Server「{server_name}」已連線：{self._safe_endpoint(endpoint_url)}",
+                f"Server「{server_name}」已連線："
+                f"{self._safe_endpoint(endpoint_url)}",
                 "INFO",
             )
             return {
@@ -335,9 +420,19 @@ class OpcuaMultiServerManager:
 
             with self._state_lock:
                 self._connected[server_name] = False
-            status_text = "已中斷" if not errors else "已中斷，但清理時發生錯誤"
-            self._set_server_status(server_name, False, status_text, "；".join(errors))
-            self._log(f"Server「{server_name}」{status_text}", "WARNING" if errors else "INFO")
+            status_text = (
+                "已中斷" if not errors else "已中斷，但清理時發生錯誤"
+            )
+            self._set_server_status(
+                server_name,
+                False,
+                status_text,
+                "；".join(errors),
+            )
+            self._log(
+                f"Server「{server_name}」{status_text}",
+                "WARNING" if errors else "INFO",
+            )
             return {
                 "server_name": server_name,
                 "connected": False,
@@ -356,7 +451,11 @@ class OpcuaMultiServerManager:
         output: dict[str, Any] = {}
         for name, result in zip(names, results):
             output[name] = (
-                {"server_name": name, "connected": False, "error": str(result)}
+                {
+                    "server_name": name,
+                    "connected": False,
+                    "error": str(result),
+                }
                 if isinstance(result, Exception)
                 else result
             )
@@ -380,20 +479,34 @@ class OpcuaMultiServerManager:
             return_exceptions=True,
         )
         return {
-            name: ({"server_name": name, "error": str(result)} if isinstance(result, Exception) else result)
+            name: (
+                {"server_name": name, "error": str(result)}
+                if isinstance(result, Exception)
+                else result
+            )
             for name, result in zip(names, results)
         }
 
     # ------------------------------------------------------------------
     # Node讀寫
     # ------------------------------------------------------------------
-    async def _read_node(self, server_name: str, node_id: str) -> dict[str, Any]:
+    async def _read_node(
+        self,
+        server_name: str,
+        node_id: str,
+    ) -> dict[str, Any]:
         client = self._require_connected(server_name)
         node_id = self._canonical_node_id(node_id)
+        config = self._configured_node_config(server_name, node_id)
         try:
             node = client.get_node(node_id)
             data_value = await node.read_data_value()
-            point_value = await self._publish_data_value(server_name, node_id, data_value)
+            point_value = await self._publish_data_value(
+                server_name,
+                node_id,
+                data_value,
+                config,
+            )
             return self._point_to_dict(point_value)
         except Exception as exc:
             self._record_point_error(server_name, node_id, "讀取", exc)
@@ -408,14 +521,29 @@ class OpcuaMultiServerManager:
     ) -> dict[str, Any]:
         client = self._require_connected(server_name)
         node_id = self._canonical_node_id(node_id)
+        config = self._configured_node_config(server_name, node_id)
         node = client.get_node(node_id)
         try:
             variant_type = await self._resolve_variant_type(node, data_type)
-            converted_value = self._convert_write_value(value_text, variant_type)
+            converted_value = self._convert_write_value(
+                value_text,
+                variant_type,
+            )
             await node.write_value(ua.Variant(converted_value, variant_type))
             data_value = await node.read_data_value()
-            point_value = await self._publish_data_value(server_name, node_id, data_value)
-            self._set_point_status(server_name, node_id, "寫入成功", "", self._now())
+            point_value = await self._publish_data_value(
+                server_name,
+                node_id,
+                data_value,
+                config,
+            )
+            self._set_point_status(
+                server_name,
+                node_id,
+                "寫入成功",
+                "",
+                self._now(),
+            )
             return self._point_to_dict(point_value)
         except Exception as exc:
             self._record_point_error(server_name, node_id, "寫入", exc)
@@ -427,8 +555,14 @@ class OpcuaMultiServerManager:
             return await node.read_data_type_as_variant_type()
         variant_type = WRITE_TYPES.get(normalized)
         if variant_type is None:
-            supported = "Auto、Boolean、Int16、Int32、Int64、UInt16、UInt32、UInt64、Float、Double、String"
-            raise ValueError(f"不支援的OPC UA寫入型別「{data_type}」，支援型別：{supported}")
+            supported = (
+                "Auto、Boolean、Byte、SByte、Int16、Int32、Int64、"
+                "UInt16、UInt32、UInt64、Float、Double、String、DateTime"
+            )
+            raise ValueError(
+                f"不支援的OPC UA寫入型別「{data_type}」，"
+                f"支援型別：{supported}"
+            )
         return variant_type
 
     def _convert_write_value(self, value_text: Any, variant_type):
@@ -436,9 +570,13 @@ class OpcuaMultiServerManager:
             if isinstance(value_text, bool):
                 return value_text
             text = str(value_text).strip().lower()
-            if text in {"1", "true", "on", "yes", "y", "是", "開", "啟用"}:
+            if text in {
+                "1", "true", "on", "yes", "y", "是", "開", "啟用"
+            }:
                 return True
-            if text in {"0", "false", "off", "no", "n", "否", "關", "停用"}:
+            if text in {
+                "0", "false", "off", "no", "n", "否", "關", "停用"
+            }:
                 return False
             raise ValueError(f"無法將「{value_text}」轉換為Boolean")
 
@@ -449,10 +587,15 @@ class OpcuaMultiServerManager:
                 value = int(str(value_text).strip())
             minimum, maximum = INTEGER_LIMITS[variant_type]
             if not minimum <= value <= maximum:
-                raise ValueError(f"整數{value}超出範圍{minimum}～{maximum}")
+                raise ValueError(
+                    f"整數{value}超出範圍{minimum}～{maximum}"
+                )
             return value
 
-        if variant_type in {ua.VariantType.Float, ua.VariantType.Double}:
+        if variant_type in {
+            ua.VariantType.Float,
+            ua.VariantType.Double,
+        }:
             value = float(value_text)
             if not math.isfinite(value):
                 raise ValueError("Float或Double不可為NaN或Infinity")
@@ -461,13 +604,40 @@ class OpcuaMultiServerManager:
         if variant_type == ua.VariantType.String:
             return str(value_text)
 
-        raise ValueError(f"Auto解析到目前未支援的寫入型別：{variant_type}")
+        if variant_type == ua.VariantType.DateTime:
+            if isinstance(value_text, datetime):
+                return value_text
+            text = str(value_text).strip().replace("Z", "+00:00")
+            if not text:
+                raise ValueError("DateTime不可為空白")
+            try:
+                return datetime.fromisoformat(text)
+            except ValueError as exc:
+                raise ValueError(
+                    "DateTime請使用ISO 8601格式，例如2026-07-22T15:30:00+08:00"
+                ) from exc
+
+        raise ValueError(
+            f"Auto解析到目前未支援的寫入型別：{variant_type}"
+        )
 
     # ------------------------------------------------------------------
     # Subscription管理
     # ------------------------------------------------------------------
-    async def _subscribe_node(self, server_name: str, node_config: Any) -> dict[str, Any]:
+    async def _subscribe_node(
+        self,
+        server_name: str,
+        node_config: Any,
+    ) -> dict[str, Any]:
         config = self._normalize_node_config(server_name, node_config)
+        if not self._to_bool(
+            config.get("enable", config.get("enabled", True)),
+            True,
+        ):
+            raise RuntimeError(
+                f"Server「{server_name}」Node「{config['node_id']}」未啟用"
+            )
+
         node_id = config["node_id"]
         if not self.is_connected(server_name):
             await self._connect_server(server_name)
@@ -480,19 +650,27 @@ class OpcuaMultiServerManager:
                 interval_ms = self._to_float(
                     server_config.get(
                         "subscription_interval_ms",
-                        server_config.get("publishing_interval_ms", DEFAULT_SUBSCRIPTION_INTERVAL_MS),
+                        server_config.get(
+                            "publishing_interval_ms",
+                            DEFAULT_SUBSCRIPTION_INTERVAL_MS,
+                        ),
                     ),
                     DEFAULT_SUBSCRIPTION_INTERVAL_MS,
                     minimum=1.0,
                 )
                 handler = _ServerSubscriptionHandler(self, server_name)
-                subscription = await client.create_subscription(interval_ms, handler)
+                subscription = await client.create_subscription(
+                    interval_ms,
+                    handler,
+                )
                 self._subscriptions[server_name] = subscription
                 self._handlers[server_name] = handler
 
             old_handle = self._handles.setdefault(server_name, {}).get(node_id)
             if old_handle is not None:
-                self._node_configs.setdefault(server_name, {})[node_id] = config
+                self._node_configs.setdefault(server_name, {})[
+                    node_id
+                ] = config
                 return {
                     "server_name": server_name,
                     "node_id": node_id,
@@ -503,15 +681,31 @@ class OpcuaMultiServerManager:
             node = client.get_node(node_id)
             handle = await subscription.subscribe_data_change(node)
             self._handles.setdefault(server_name, {})[node_id] = handle
-            self._node_configs.setdefault(server_name, {})[node_id] = config
-            self._set_point_status(server_name, node_id, "已訂閱", "", self._now())
+            self._node_configs.setdefault(server_name, {})[
+                node_id
+            ] = config
+            self._set_point_status(
+                server_name,
+                node_id,
+                "已訂閱",
+                "",
+                self._now(),
+            )
 
-        # 訂閱後主動讀取一次，UI可立即取得初始值。
         try:
             data_value = await node.read_data_value()
-            await self._publish_data_value(server_name, node_id, data_value, config)
+            await self._publish_data_value(
+                server_name,
+                node_id,
+                data_value,
+                config,
+            )
         except Exception as exc:
-            self._log(f"Server「{server_name}」Node「{node_id}」初始讀取失敗：{exc}", "WARNING")
+            self._log(
+                f"Server「{server_name}」Node「{node_id}」"
+                f"初始讀取失敗：{exc}",
+                "WARNING",
+            )
 
         return {
             "server_name": server_name,
@@ -520,7 +714,11 @@ class OpcuaMultiServerManager:
             "already_subscribed": False,
         }
 
-    async def _unsubscribe_node(self, server_name: str, node_id: str) -> dict[str, Any]:
+    async def _unsubscribe_node(
+        self,
+        server_name: str,
+        node_id: str,
+    ) -> dict[str, Any]:
         node_id = self._canonical_node_id(node_id)
         async with self._server_lock(server_name):
             subscription = self._subscriptions.get(server_name)
@@ -535,7 +733,13 @@ class OpcuaMultiServerManager:
                 }
             if subscription is not None:
                 await subscription.unsubscribe(handle)
-            self._set_point_status(server_name, node_id, "已取消訂閱", "", self._now())
+            self._set_point_status(
+                server_name,
+                node_id,
+                "已取消訂閱",
+                "",
+                self._now(),
+            )
             return {
                 "server_name": server_name,
                 "node_id": node_id,
@@ -546,12 +750,33 @@ class OpcuaMultiServerManager:
     async def _subscribe_all(self) -> dict[str, Any]:
         await self._connect_all()
         output: dict[str, Any] = {}
-        for server_name, server_config in list(self._server_configs.items()):
+        for server_name, server_config in list(
+            self._server_configs.items()
+        ):
             nodes = server_config.get("nodes", [])
             results: list[dict[str, Any]] = []
             for node_config in nodes:
+                if isinstance(node_config, Mapping):
+                    enabled = self._to_bool(
+                        node_config.get(
+                            "enable",
+                            node_config.get("enabled", True),
+                        ),
+                        True,
+                    )
+                    subscribe = self._to_bool(
+                        node_config.get("subscribe", True),
+                        True,
+                    )
+                    if not enabled or not subscribe:
+                        continue
                 try:
-                    results.append(await self._subscribe_node(server_name, node_config))
+                    results.append(
+                        await self._subscribe_node(
+                            server_name,
+                            node_config,
+                        )
+                    )
                 except Exception as exc:
                     node_id = (
                         str(node_config.get("node_id", ""))
@@ -566,17 +791,27 @@ class OpcuaMultiServerManager:
                             "error": str(exc),
                         }
                     )
-            output[server_name] = {"server_name": server_name, "nodes": results}
+            output[server_name] = {
+                "server_name": server_name,
+                "nodes": results,
+            }
         return output
 
     async def _on_datachange(self, server_name: str, node, value, data):
         try:
-            node_id = self._canonical_node_id(getattr(node, "nodeid", node))
+            node_id = self._canonical_node_id(
+                getattr(node, "nodeid", node)
+            )
             config = self._node_configs.get(server_name, {}).get(node_id)
             monitored_item = getattr(data, "monitored_item", None)
             data_value = getattr(monitored_item, "Value", None)
             if data_value is not None:
-                await self._publish_data_value(server_name, node_id, data_value, config)
+                await self._publish_data_value(
+                    server_name,
+                    node_id,
+                    data_value,
+                    config,
+                )
             else:
                 await self._publish_value(
                     server_name,
@@ -587,12 +822,19 @@ class OpcuaMultiServerManager:
                     timestamp=self._now(),
                 )
         except Exception as exc:
-            self._log(f"Server「{server_name}」資料變更處理失敗：{exc}", "ERROR")
+            self._log(
+                f"Server「{server_name}」資料變更處理失敗：{exc}",
+                "ERROR",
+            )
 
     # ------------------------------------------------------------------
     # Browse與遞迴掃描
     # ------------------------------------------------------------------
-    async def _browse_node(self, server_name: str, node_id: str) -> list[dict[str, Any]]:
+    async def _browse_node(
+        self,
+        server_name: str,
+        node_id: str,
+    ) -> list[dict[str, Any]]:
         client = self._require_connected(server_name)
         node_id = self._canonical_node_id(node_id)
         parent = client.get_node(node_id)
@@ -601,7 +843,12 @@ class OpcuaMultiServerManager:
         records: list[dict[str, Any]] = []
         for description in descriptions:
             records.append(
-                await self._record_from_description(client, description, parent_path, 1)
+                await self._record_from_description(
+                    client,
+                    description,
+                    parent_path,
+                    1,
+                )
             )
         return records
 
@@ -637,7 +884,10 @@ class OpcuaMultiServerManager:
             try:
                 descriptions = await current.get_children_descriptions()
             except Exception as exc:
-                self._log(f"掃描Node「{current_id}」失敗：{exc}", "DEBUG")
+                self._log(
+                    f"掃描Node「{current_id}」失敗：{exc}",
+                    "DEBUG",
+                )
                 continue
 
             for description in descriptions:
@@ -660,7 +910,9 @@ class OpcuaMultiServerManager:
                     output.append(record)
 
                 if child_depth < max_depth and child_id not in visited:
-                    queue.append((child_id, record["path"], child_depth))
+                    queue.append(
+                        (child_id, record["path"], child_depth)
+                    )
 
         return output
 
@@ -671,14 +923,26 @@ class OpcuaMultiServerManager:
         parent_path: str,
         depth: int,
     ) -> dict[str, Any]:
-        node_id = self._canonical_node_id(getattr(description, "NodeId", ""))
-        display_name = self._localized_text(getattr(description, "DisplayName", ""))
-        browse_name = self._qualified_name_text(getattr(description, "BrowseName", ""))
-        node_class = self._node_class_name(getattr(description, "NodeClass", ""))
+        node_id = self._canonical_node_id(
+            getattr(description, "NodeId", "")
+        )
+        display_name = self._localized_text(
+            getattr(description, "DisplayName", "")
+        )
+        browse_name = self._qualified_name_text(
+            getattr(description, "BrowseName", "")
+        )
+        node_class = self._node_class_name(
+            getattr(description, "NodeClass", "")
+        )
         child = client.get_node(node_id)
         data_type = await self._read_data_type(child, node_class)
         label = display_name or browse_name or node_id
-        path = f"{parent_path.rstrip('/')}/{label}" if parent_path else label
+        path = (
+            f"{parent_path.rstrip('/')}/{label}"
+            if parent_path
+            else label
+        )
         return {
             "display_name": display_name,
             "browse_name": browse_name,
@@ -702,7 +966,11 @@ class OpcuaMultiServerManager:
         try:
             path = await node.get_path(as_string=True)
             if isinstance(path, (list, tuple)):
-                return "/".join(str(item).strip("/") for item in path if str(item))
+                return "/".join(
+                    str(item).strip("/")
+                    for item in path
+                    if str(item)
+                )
             return str(path)
         except Exception:
             return fallback
@@ -724,8 +992,15 @@ class OpcuaMultiServerManager:
             self._operation_locks.clear()
             self.latest_status = {}
             for server_name in new_configs:
-                self._set_server_status(server_name, False, "設定已重新載入，尚未連線")
-        self._log(f"OPC UA設定已重新載入，共{len(new_configs)}個Server", "INFO")
+                self._set_server_status(
+                    server_name,
+                    False,
+                    "設定已重新載入，尚未連線",
+                )
+        self._log(
+            f"OPC UA設定已重新載入，共{len(new_configs)}個Server",
+            "INFO",
+        )
         return {
             "reloaded": True,
             "server_count": len(new_configs),
@@ -742,9 +1017,15 @@ class OpcuaMultiServerManager:
         data_value,
         config: Mapping[str, Any] | None = None,
     ) -> PointValue:
-        value = getattr(getattr(data_value, "Value", None), "Value", None)
+        value = getattr(
+            getattr(data_value, "Value", None),
+            "Value",
+            None,
+        )
         status_code = getattr(data_value, "StatusCode", None)
-        status_text = str(status_code) if status_code is not None else "Unknown"
+        status_text = (
+            str(status_code) if status_code is not None else "Unknown"
+        )
         source_time = getattr(data_value, "SourceTimestamp", None)
         server_time = getattr(data_value, "ServerTimestamp", None)
         timestamp = source_time or server_time or self._now()
@@ -767,16 +1048,27 @@ class OpcuaMultiServerManager:
         timestamp: datetime,
     ) -> PointValue:
         node_id = self._canonical_node_id(node_id)
-        normalized = self._normalize_node_config(server_name, config or {"node_id": node_id})
+        normalized = self._normalize_node_config(
+            server_name,
+            config or {"node_id": node_id},
+        )
         data_type = str(normalized.get("data_type", "Auto") or "Auto")
         if data_type.upper() == "AUTO":
-            data_type = type(value).__name__ if value is not None else "NoneType"
+            data_type = (
+                type(value).__name__
+                if value is not None
+                else "NoneType"
+            )
 
         point_value = PointValue(
             point_key=make_opcua_point_key(server_name, node_id),
             protocol=PROTOCOL_OPCUA,
-            source_name=str(normalized.get("source_name", server_name)),
-            device_name=str(normalized.get("device_name", server_name)),
+            source_name=str(
+                normalized.get("source_name", server_name)
+            ),
+            device_name=str(
+                normalized.get("device_name", server_name)
+            ),
             point_name=str(normalized.get("point_name", node_id)),
             address_text=node_id,
             value=value,
@@ -784,36 +1076,35 @@ class OpcuaMultiServerManager:
             value_number=self._value_number(value),
             status_text=status_text,
             timestamp=timestamp,
-            writable=self._to_bool(normalized.get("writable", False)),
+            writable=self._to_bool(
+                normalized.get("writable", False)
+            ),
             data_type=data_type,
             raw_config=self._sanitize(normalized),
         )
 
         with self._state_lock:
             self.latest_values[point_value.point_key] = point_value
-        self._set_point_status(server_name, node_id, status_text, "", timestamp)
+        self._set_point_status(
+            server_name,
+            node_id,
+            status_text,
+            "",
+            timestamp,
+        )
         self.value_bus.publish(point_value)
         return point_value
 
     def _point_to_dict(self, point_value: PointValue) -> dict[str, Any]:
-        return {
-            "point_key": point_value.point_key,
-            "protocol": point_value.protocol,
-            "source_name": point_value.source_name,
-            "device_name": point_value.device_name,
-            "point_name": point_value.point_name,
-            "address_text": point_value.address_text,
-            "value": point_value.value,
-            "value_text": point_value.value_text,
-            "value_number": point_value.value_number,
-            "status_text": point_value.status_text,
-            "timestamp": point_value.timestamp,
-            "writable": point_value.writable,
-            "data_type": point_value.data_type,
-            "raw_config": point_value.raw_config,
-        }
+        return point_value.to_dict()
 
-    def _record_point_error(self, server_name: str, node_id: str, action: str, exc: Exception):
+    def _record_point_error(
+        self,
+        server_name: str,
+        node_id: str,
+        action: str,
+        exc: Exception,
+    ):
         error_text = str(exc)
         self._set_point_status(
             server_name,
@@ -823,7 +1114,8 @@ class OpcuaMultiServerManager:
             self._now(),
         )
         self._log(
-            f"Server「{server_name}」Node「{node_id}」{action}失敗：{error_text}",
+            f"Server「{server_name}」Node「{node_id}」"
+            f"{action}失敗：{error_text}",
             "ERROR",
         )
 
@@ -868,20 +1160,37 @@ class OpcuaMultiServerManager:
     # ------------------------------------------------------------------
     def _load_server_configs(self) -> dict[str, dict[str, Any]]:
         root = self._config_snapshot()
-        opcua = root.get("opcua", root.get("OPCUA", root.get("opc_ua", {})))
+        opcua = root.get(
+            "opcua",
+            root.get("OPCUA", root.get("opc_ua", {})),
+        )
         if not opcua and "opcua_servers" in root:
             opcua = {"servers": root.get("opcua_servers")}
+
+        if isinstance(opcua, Mapping):
+            root_enabled = self._to_bool(
+                opcua.get("enable", opcua.get("enabled", True)),
+                True,
+            )
+            if not root_enabled:
+                return {}
 
         if isinstance(opcua, list):
             raw_servers = opcua
         elif isinstance(opcua, Mapping):
-            raw_servers = opcua.get("servers", opcua.get("server_list", []))
+            raw_servers = opcua.get(
+                "servers",
+                opcua.get("server_list", []),
+            )
         else:
             raw_servers = []
 
         items: list[tuple[str | None, Any]] = []
         if isinstance(raw_servers, Mapping):
-            items = [(str(name), value) for name, value in raw_servers.items()]
+            items = [
+                (str(name), value)
+                for name, value in raw_servers.items()
+            ]
         elif isinstance(raw_servers, list):
             items = [(None, value) for value in raw_servers]
 
@@ -890,24 +1199,55 @@ class OpcuaMultiServerManager:
             if not isinstance(raw, Mapping):
                 continue
             config = copy.deepcopy(dict(raw))
-            if not self._to_bool(config.get("enabled", True), True):
+            enabled = self._to_bool(
+                config.get("enable", config.get("enabled", True)),
+                True,
+            )
+            if not enabled:
                 continue
+
             server_name = str(
-                config.get("server_name", config.get("name", mapping_name or "")) or ""
+                config.get(
+                    "server_name",
+                    config.get("name", mapping_name or ""),
+                )
+                or ""
             ).strip()
             if not server_name:
                 continue
-            endpoint = config.get("endpoint_url", config.get("endpoint", config.get("url", "")))
+
+            endpoint = config.get(
+                "endpoint_url",
+                config.get("endpoint", config.get("url", "")),
+            )
+            config["enable"] = True
             config["server_name"] = server_name
             config["endpoint_url"] = str(endpoint or "").strip()
-            nodes = config.get("nodes", config.get("points", config.get("subscriptions", [])))
+            nodes = config.get(
+                "nodes",
+                config.get(
+                    "points",
+                    config.get("subscriptions", []),
+                ),
+            )
             if isinstance(nodes, Mapping):
                 nodes = [
-                    dict(value, node_id=value.get("node_id", key))
+                    dict(
+                        value,
+                        node_id=value.get("node_id", key),
+                    )
                     for key, value in nodes.items()
                     if isinstance(value, Mapping)
                 ]
-            config["nodes"] = nodes if isinstance(nodes, list) else []
+            config["nodes"] = (
+                copy.deepcopy(nodes)
+                if isinstance(nodes, list)
+                else []
+            )
+            if server_name in output:
+                raise ValueError(
+                    f"OPC UA Server名稱重複：{server_name}"
+                )
             output[server_name] = config
         return output
 
@@ -920,7 +1260,9 @@ class OpcuaMultiServerManager:
             except TypeError:
                 pass
         for attr in ("config", "data", "settings"):
-            candidates.append(getattr(self.config_manager, attr, None))
+            candidates.append(
+                getattr(self.config_manager, attr, None)
+            )
         for candidate in candidates:
             if isinstance(candidate, Mapping):
                 return copy.deepcopy(dict(candidate))
@@ -935,23 +1277,85 @@ class OpcuaMultiServerManager:
             config = copy.deepcopy(dict(node_config))
         else:
             config = {"node_id": str(node_config)}
-        node_id = config.get("node_id", config.get("address", config.get("address_text", "")))
+        node_id = config.get(
+            "node_id",
+            config.get(
+                "address",
+                config.get("address_text", ""),
+            ),
+        )
         node_id = self._canonical_node_id(node_id)
         if not node_id:
-            raise ValueError(f"Server「{server_name}」的Node設定缺少node_id")
+            raise ValueError(
+                f"Server「{server_name}」的Node設定缺少node_id"
+            )
         config["node_id"] = node_id
+        config.setdefault(
+            "enable",
+            config.get("enabled", True),
+        )
+        config.setdefault("server_name", server_name)
         config.setdefault("source_name", server_name)
         config.setdefault("device_name", server_name)
-        config.setdefault("point_name", config.get("name", node_id))
+        config.setdefault(
+            "point_name",
+            config.get("name", node_id),
+        )
         config.setdefault("writable", False)
         config.setdefault("data_type", "Auto")
         return config
 
-    def _require_server_config(self, server_name: str) -> dict[str, Any]:
+    def _configured_node_config(
+        self,
+        server_name: str,
+        node_id: str,
+    ) -> dict[str, Any]:
+        node_id = self._canonical_node_id(node_id)
+        with self._state_lock:
+            subscribed = self._node_configs.get(
+                server_name,
+                {},
+            ).get(node_id)
+            server_config = self._server_configs.get(server_name)
+        if isinstance(subscribed, Mapping):
+            return self._normalize_node_config(
+                server_name,
+                subscribed,
+            )
+
+        if isinstance(server_config, Mapping):
+            nodes = server_config.get("nodes", [])
+            if isinstance(nodes, list):
+                for node_config in nodes:
+                    if not isinstance(node_config, Mapping):
+                        continue
+                    configured_id = self._canonical_node_id(
+                        node_config.get(
+                            "node_id",
+                            node_config.get("address", ""),
+                        )
+                    )
+                    if configured_id == node_id:
+                        return self._normalize_node_config(
+                            server_name,
+                            node_config,
+                        )
+
+        return self._normalize_node_config(
+            server_name,
+            {"node_id": node_id},
+        )
+
+    def _require_server_config(
+        self,
+        server_name: str,
+    ) -> dict[str, Any]:
         with self._state_lock:
             config = self._server_configs.get(server_name)
         if config is None:
-            raise KeyError(f"找不到OPC UA Server設定：{server_name}")
+            raise KeyError(
+                f"找不到OPC UA Server設定：{server_name}"
+            )
         return config
 
     def _require_connected(self, server_name: str) -> Client:
@@ -959,7 +1363,9 @@ class OpcuaMultiServerManager:
             client = self._clients.get(server_name)
             connected = self._connected.get(server_name, False)
         if client is None or not connected:
-            raise RuntimeError(f"OPC UA Server「{server_name}」尚未連線")
+            raise RuntimeError(
+                f"OPC UA Server「{server_name}」尚未連線"
+            )
         return client
 
     def _canonical_node_id(self, node_id: Any) -> str:
@@ -994,7 +1400,11 @@ class OpcuaMultiServerManager:
         namespace_index = getattr(value, "NamespaceIndex", None)
         if name is None:
             return str(value or "")
-        return f"{namespace_index}:{name}" if namespace_index not in (None, 0) else str(name)
+        return (
+            f"{namespace_index}:{name}"
+            if namespace_index not in (None, 0)
+            else str(name)
+        )
 
     def _value_text(self, value: Any) -> str:
         if value is None:
@@ -1003,7 +1413,11 @@ class OpcuaMultiServerManager:
             return value.hex(" ")
         if isinstance(value, (dict, list, tuple)):
             try:
-                return json.dumps(value, ensure_ascii=False, default=str)
+                return json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    default=str,
+                )
             except TypeError:
                 pass
         return str(value)
@@ -1021,17 +1435,37 @@ class OpcuaMultiServerManager:
         try:
             parsed = urlsplit(text)
             hostname = parsed.hostname or ""
-            port = f":{parsed.port}" if parsed.port is not None else ""
+            port = (
+                f":{parsed.port}"
+                if parsed.port is not None
+                else ""
+            )
             return urlunsplit(
-                (parsed.scheme, f"{hostname}{port}", parsed.path, parsed.query, parsed.fragment)
+                (
+                    parsed.scheme,
+                    f"{hostname}{port}",
+                    parsed.path,
+                    parsed.query,
+                    parsed.fragment,
+                )
             )
         except Exception:
             return text
 
-    def _redact_error(self, config: Mapping[str, Any], exc: Exception) -> str:
+    def _redact_error(
+        self,
+        config: Mapping[str, Any],
+        exc: Exception,
+    ) -> str:
         text = str(exc)
-        auth = config.get("auth") if isinstance(config.get("auth"), Mapping) else {}
-        password = str(config.get("password", auth.get("password", "")) or "")
+        auth = (
+            config.get("auth")
+            if isinstance(config.get("auth"), Mapping)
+            else {}
+        )
+        password = str(
+            config.get("password", auth.get("password", "")) or ""
+        )
         if password:
             text = text.replace(password, "***")
         return text
@@ -1039,7 +1473,11 @@ class OpcuaMultiServerManager:
     def _sanitize(self, value: Any) -> Any:
         if isinstance(value, Mapping):
             return {
-                str(key): ("" if str(key).lower() in SECRET_KEYS else self._sanitize(item))
+                str(key): (
+                    ""
+                    if str(key).lower() in SECRET_KEYS
+                    else self._sanitize(item)
+                )
                 for key, item in value.items()
             }
         if isinstance(value, list):
@@ -1054,13 +1492,22 @@ class OpcuaMultiServerManager:
         if value is None:
             return default
         text = str(value).strip().lower()
-        if text in {"1", "true", "yes", "on", "y", "是", "啟用"}:
+        if text in {
+            "1", "true", "yes", "on", "y", "是", "啟用"
+        }:
             return True
-        if text in {"0", "false", "no", "off", "n", "否", "停用"}:
+        if text in {
+            "0", "false", "no", "off", "n", "否", "停用"
+        }:
             return False
         return default
 
-    def _to_float(self, value: Any, default: float, minimum: float | None = None) -> float:
+    def _to_float(
+        self,
+        value: Any,
+        default: float,
+        minimum: float | None = None,
+    ) -> float:
         try:
             result = float(value)
         except (TypeError, ValueError):
@@ -1075,8 +1522,11 @@ class OpcuaMultiServerManager:
         if callback is None:
             return
         try:
-            callback(message)
+            callback(message, level)
         except TypeError:
-            callback(level, message)
+            try:
+                callback(message)
+            except TypeError:
+                callback(level, message)
         except Exception:
             pass
