@@ -1,12 +1,11 @@
 """資料庫設定頁面。
 
-本頁面只負責設定資料與呼叫DatabaseManager公開介面，
-不會直接建立pymysql連線。
+此模組僅負責資料庫設定與操作介面。實際連線、建表及資料上傳
+皆透過app_context.database_manager執行，不在UI層直接操作pymysql。
 """
 
 from __future__ import annotations
 
-import copy
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -19,22 +18,35 @@ class DatabasePage(ttk.Frame):
     def __init__(self, parent, app_context):
         super().__init__(parent)
         self.app_context = app_context
-        self.config_manager = app_context["config_manager"]
-        self.database_manager = app_context["database_manager"]
-        self.log_func: Callable[[str], None] = app_context.get("log_func", print)
-        self.refresh_all: Callable[[], None] = app_context.get(
-            "refresh_all", lambda: None
+        self.config_manager = self._context_get(
+            app_context,
+            "config_manager",
+        )
+        self.database_manager = self._context_get(
+            app_context,
+            "database_manager",
+        )
+        self.log_func: Callable[[str], None] = self._context_get(
+            app_context,
+            "log_func",
+            lambda message: None,
+        )
+        self.refresh_all: Callable[[], None] = self._context_get(
+            app_context,
+            "refresh_all",
+            lambda: None,
         )
 
-        self._busy = False
-        self._auto_write_running = False
+        self._operation_running = False
+        self._local_auto_write_running = False
+        self._status_after_id: Optional[str] = None
 
         self.enable_var = tk.BooleanVar(value=False)
         self.host_var = tk.StringVar(value="127.0.0.1")
         self.port_var = tk.StringVar(value="3306")
-        self.user_var = tk.StringVar(value="root")
+        self.user_var = tk.StringVar(value="")
         self.password_var = tk.StringVar(value="")
-        self.database_var = tk.StringVar(value="multi_protocol_plc_hmi")
+        self.database_var = tk.StringVar(value="")
         self.charset_var = tk.StringVar(value="utf8mb4")
         self.connect_timeout_var = tk.StringVar(value="5")
         self.write_history_var = tk.BooleanVar(value=True)
@@ -47,337 +59,305 @@ class DatabasePage(ttk.Frame):
 
         self._build_ui()
         self.load_settings()
-        self.refresh_status()
+        self._schedule_status_refresh()
+
+    @staticmethod
+    def _context_get(
+        app_context: Any,
+        key: str,
+        default: Any = None,
+    ) -> Any:
+        """同時支援字典與屬性型app_context。"""
+        if isinstance(app_context, dict):
+            if key in app_context:
+                return app_context[key]
+        elif hasattr(app_context, key):
+            return getattr(app_context, key)
+
+        if default is not None:
+            return default
+        raise KeyError(f"app_context缺少必要項目：{key}")
 
     def _build_ui(self) -> None:
         """建立頁面元件。"""
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(1, weight=1)
 
-        title_frame = ttk.Frame(self, padding=(12, 12, 12, 6))
-        title_frame.grid(row=0, column=0, sticky="ew")
-        title_frame.columnconfigure(0, weight=1)
+        header = ttk.Frame(self)
+        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        header.columnconfigure(0, weight=1)
 
         ttk.Label(
-            title_frame,
+            header,
             text="資料庫設定",
             font=("TkDefaultFont", 15, "bold"),
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
-            title_frame,
-            text="設定MySQL/MariaDB連線，並控制即時資料自動上傳。",
+            header,
+            text="設定資料庫連線資訊、寫入模式與自動上傳狀態",
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
-        content = ttk.Frame(self, padding=(12, 6, 12, 6))
-        content.grid(row=1, column=0, sticky="nsew")
-        content.columnconfigure(0, weight=1)
-        content.columnconfigure(1, weight=1)
+        body = ttk.Frame(self)
+        body.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(0, weight=1)
 
-        connection_frame = ttk.LabelFrame(content, text="連線設定", padding=12)
-        connection_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        connection_frame.columnconfigure(1, weight=1)
+        self._build_connection_frame(body)
+        self._build_write_frame(body)
+        self._build_status_frame(body)
+        self._build_button_frame()
+
+    def _build_connection_frame(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="資料庫連線設定", padding=12)
+        frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        frame.columnconfigure(1, weight=1)
 
         ttk.Checkbutton(
-            connection_frame,
+            frame,
             text="啟用資料庫功能",
             variable=self.enable_var,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-        self._add_entry(connection_frame, 1, "主機位址", self.host_var)
-        self._add_entry(connection_frame, 2, "連接埠", self.port_var)
-        self._add_entry(connection_frame, 3, "使用者名稱", self.user_var)
-        self._add_entry(
-            connection_frame,
-            4,
-            "密碼",
-            self.password_var,
-            show="*",
-        )
-        self._add_entry(connection_frame, 5, "資料庫名稱", self.database_var)
-
-        ttk.Label(connection_frame, text="字元編碼").grid(
-            row=6, column=0, sticky="w", padx=(0, 10), pady=4
-        )
-        charset_box = ttk.Combobox(
-            connection_frame,
-            textvariable=self.charset_var,
-            values=("utf8mb4", "utf8", "latin1"),
-            state="normal",
-        )
-        charset_box.grid(row=6, column=1, sticky="ew", pady=4)
-
-        self._add_entry(
-            connection_frame,
-            7,
-            "連線逾時（秒）",
-            self.connect_timeout_var,
+        fields = (
+            ("主機位址", self.host_var, False),
+            ("連接埠", self.port_var, False),
+            ("使用者名稱", self.user_var, False),
+            ("密碼", self.password_var, True),
+            ("資料庫名稱", self.database_var, False),
+            ("字元編碼", self.charset_var, False),
+            ("連線逾時（秒）", self.connect_timeout_var, False),
         )
 
-        write_frame = ttk.LabelFrame(content, text="寫入設定", padding=12)
-        write_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        write_frame.columnconfigure(0, weight=1)
+        for row, (label_text, variable, is_password) in enumerate(fields, start=1):
+            ttk.Label(frame, text=label_text).grid(
+                row=row,
+                column=0,
+                sticky="w",
+                padx=(0, 10),
+                pady=4,
+            )
+            entry = ttk.Entry(
+                frame,
+                textvariable=variable,
+                show="●" if is_password else "",
+            )
+            entry.grid(row=row, column=1, sticky="ew", pady=4)
+
+    def _build_write_frame(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="資料寫入設定", padding=12)
+        frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        frame.columnconfigure(0, weight=1)
 
         ttk.Checkbutton(
-            write_frame,
-            text="寫入歷史資料表",
+            frame,
+            text="寫入歷史資料",
             variable=self.write_history_var,
         ).grid(row=0, column=0, sticky="w", pady=5)
+
         ttk.Checkbutton(
-            write_frame,
-            text="更新最新值資料表",
+            frame,
+            text="更新最新資料",
             variable=self.write_latest_var,
         ).grid(row=1, column=0, sticky="w", pady=5)
+
         ttk.Checkbutton(
-            write_frame,
+            frame,
             text="僅在數值變更時寫入",
             variable=self.write_only_on_change_var,
         ).grid(row=2, column=0, sticky="w", pady=5)
 
-        ttk.Separator(write_frame).grid(row=3, column=0, sticky="ew", pady=12)
-
-        status_grid = ttk.Frame(write_frame)
-        status_grid.grid(row=4, column=0, sticky="ew")
-        status_grid.columnconfigure(1, weight=1)
-
-        ttk.Label(status_grid, text="資料庫連線：").grid(
-            row=0, column=0, sticky="w", pady=4
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            pady=12,
         )
-        self.connection_status_label = ttk.Label(
-            status_grid, textvariable=self.connection_status_var
-        )
-        self.connection_status_label.grid(row=0, column=1, sticky="w", pady=4)
 
-        ttk.Label(status_grid, text="自動上傳：").grid(
-            row=1, column=0, sticky="w", pady=4
-        )
-        self.auto_write_status_label = ttk.Label(
-            status_grid, textvariable=self.auto_write_status_var
-        )
-        self.auto_write_status_label.grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(
+            frame,
+            text=(
+                "密碼欄位會交由ConfigManager儲存。"
+                "請勿將含有真實密碼的設定檔提交至GitHub。"
+            ),
+            wraplength=300,
+            justify="left",
+        ).grid(row=4, column=0, sticky="ew")
 
-        action_frame = ttk.LabelFrame(self, text="操作", padding=12)
-        action_frame.grid(row=2, column=0, sticky="new", padx=12, pady=(6, 12))
-        for column in range(5):
-            action_frame.columnconfigure(column, weight=1)
+    def _build_status_frame(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="資料庫狀態", padding=12)
+        frame.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(12, 0),
+        )
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="連線狀態：").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            pady=3,
+        )
+        ttk.Label(
+            frame,
+            textvariable=self.connection_status_var,
+            font=("TkDefaultFont", 10, "bold"),
+        ).grid(row=0, column=1, sticky="w", pady=3)
+
+        ttk.Label(frame, text="自動上傳：").grid(
+            row=1,
+            column=0,
+            sticky="w",
+            pady=3,
+        )
+        ttk.Label(
+            frame,
+            textvariable=self.auto_write_status_var,
+            font=("TkDefaultFont", 10, "bold"),
+        ).grid(row=1, column=1, sticky="w", pady=3)
+
+        ttk.Label(frame, text="目前操作：").grid(
+            row=2,
+            column=0,
+            sticky="w",
+            pady=3,
+        )
+        ttk.Label(
+            frame,
+            textvariable=self.operation_status_var,
+        ).grid(row=2, column=1, sticky="w", pady=3)
+
+    def _build_button_frame(self) -> None:
+        frame = ttk.Frame(self)
+        frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(6, 12))
 
         self.save_button = ttk.Button(
-            action_frame,
+            frame,
             text="儲存設定",
             command=self.save_settings,
         )
-        self.save_button.grid(row=0, column=0, sticky="ew", padx=4)
+        self.save_button.grid(row=0, column=0, padx=(0, 6), pady=4)
 
         self.test_button = ttk.Button(
-            action_frame,
+            frame,
             text="測試連線",
             command=self.test_connection,
         )
-        self.test_button.grid(row=0, column=1, sticky="ew", padx=4)
+        self.test_button.grid(row=0, column=1, padx=6, pady=4)
 
-        self.ensure_button = ttk.Button(
-            action_frame,
+        self.ensure_tables_button = ttk.Button(
+            frame,
             text="自動建立資料表",
             command=self.ensure_tables,
         )
-        self.ensure_button.grid(row=0, column=2, sticky="ew", padx=4)
+        self.ensure_tables_button.grid(row=0, column=2, padx=6, pady=4)
 
         self.start_button = ttk.Button(
-            action_frame,
+            frame,
             text="啟動自動上傳",
             command=self.start_auto_write,
         )
-        self.start_button.grid(row=0, column=3, sticky="ew", padx=4)
+        self.start_button.grid(row=0, column=3, padx=6, pady=4)
 
         self.stop_button = ttk.Button(
-            action_frame,
+            frame,
             text="停止自動上傳",
             command=self.stop_auto_write,
         )
-        self.stop_button.grid(row=0, column=4, sticky="ew", padx=4)
-
-        ttk.Label(
-            action_frame,
-            textvariable=self.operation_status_var,
-            anchor="w",
-        ).grid(row=1, column=0, columnspan=5, sticky="ew", padx=4, pady=(10, 0))
-
-        self._action_buttons = (
-            self.save_button,
-            self.test_button,
-            self.ensure_button,
-            self.start_button,
-            self.stop_button,
-        )
-
-    @staticmethod
-    def _add_entry(
-        parent: ttk.Frame,
-        row: int,
-        label_text: str,
-        variable: tk.StringVar,
-        show: Optional[str] = None,
-    ) -> ttk.Entry:
-        ttk.Label(parent, text=label_text).grid(
-            row=row, column=0, sticky="w", padx=(0, 10), pady=4
-        )
-        entry = ttk.Entry(parent, textvariable=variable, show=show or "")
-        entry.grid(row=row, column=1, sticky="ew", pady=4)
-        return entry
+        self.stop_button.grid(row=0, column=4, padx=(6, 0), pady=4)
 
     def load_settings(self) -> None:
-        """從ConfigManager載入database設定。"""
-        config = self._get_full_config()
-        database_config = config.get("database", {})
-        if not isinstance(database_config, dict):
-            database_config = {}
-
-        self.enable_var.set(bool(database_config.get("enable", False)))
-        self.host_var.set(str(database_config.get("host", "127.0.0.1")))
-        self.port_var.set(str(database_config.get("port", 3306)))
-        self.user_var.set(str(database_config.get("user", "root")))
-        self.password_var.set(str(database_config.get("password", "")))
-        self.database_var.set(
-            str(database_config.get("database", "multi_protocol_plc_hmi"))
-        )
-        self.charset_var.set(str(database_config.get("charset", "utf8mb4")))
-        self.connect_timeout_var.set(
-            str(database_config.get("connect_timeout", 5))
-        )
-        self.write_history_var.set(
-            bool(database_config.get("write_history", True))
-        )
-        self.write_latest_var.set(
-            bool(database_config.get("write_latest", True))
-        )
-        self.write_only_on_change_var.set(
-            bool(database_config.get("write_only_on_change", True))
-        )
-        self.operation_status_var.set("已載入資料庫設定")
-
-    def save_settings(self, show_message: bool = True) -> bool:
-        """驗證並保存database設定，成功後重新載入DatabaseManager。"""
+        """從ConfigManager載入database區段。"""
         try:
-            database_config = self._collect_database_config()
-            full_config = self._get_full_config()
-            full_config["database"] = database_config
-            self._save_full_config(full_config)
-            self.database_manager.reload_config()
-            self.operation_status_var.set("資料庫設定已儲存")
-            self._log("資料庫設定已儲存並重新載入")
-            self.refresh_all()
-            if show_message:
-                messagebox.showinfo("儲存完成", "資料庫設定已成功儲存。")
-            return True
-        except (TypeError, ValueError) as exc:
-            self.operation_status_var.set(f"設定錯誤：{exc}")
-            if show_message:
-                messagebox.showerror("設定錯誤", str(exc))
-            return False
-        except Exception as exc:  # UI層需顯示管理器或設定檔錯誤
-            self.operation_status_var.set(f"儲存失敗：{exc}")
-            self._log(f"資料庫設定儲存失敗：{exc}")
-            if show_message:
-                messagebox.showerror("儲存失敗", f"無法儲存資料庫設定：\n{exc}")
-            return False
-
-    def test_connection(self) -> None:
-        """儲存設定後，透過DatabaseManager測試資料庫連線。"""
-        if not self.save_settings(show_message=False):
+            config = self._get_database_config()
+        except Exception as exc:
+            self.operation_status_var.set("載入設定失敗")
+            self._log(f"載入資料庫設定失敗：{exc}")
             return
 
-        self.connection_status_var.set("測試中...")
-        self._run_background(
-            operation_name="測試資料庫連線",
-            target=self.database_manager.test_connection,
-            on_success=self._on_connection_test_success,
-            on_error=self._on_connection_test_error,
+        self.enable_var.set(self._as_bool(config.get("enable", False)))
+        self.host_var.set(str(config.get("host", "127.0.0.1")))
+        self.port_var.set(str(config.get("port", 3306)))
+        self.user_var.set(str(config.get("user", "")))
+        self.password_var.set(str(config.get("password", "")))
+        self.database_var.set(str(config.get("database", "")))
+        self.charset_var.set(str(config.get("charset", "utf8mb4")))
+        self.connect_timeout_var.set(str(config.get("connect_timeout", 5)))
+        self.write_history_var.set(
+            self._as_bool(config.get("write_history", True))
+        )
+        self.write_latest_var.set(
+            self._as_bool(config.get("write_latest", True))
+        )
+        self.write_only_on_change_var.set(
+            self._as_bool(config.get("write_only_on_change", True))
+        )
+        self.operation_status_var.set("設定已載入")
+
+    def save_settings(self) -> None:
+        """驗證並儲存資料庫設定，再重新載入DatabaseManager。"""
+        try:
+            database_config = self._collect_database_config()
+            self._save_database_config(database_config)
+            self.database_manager.reload_config()
+            self.refresh_all()
+        except Exception as exc:
+            self.operation_status_var.set("儲存設定失敗")
+            self._log(f"儲存資料庫設定失敗：{exc}")
+            messagebox.showerror("儲存失敗", str(exc), parent=self)
+            return
+
+        self.operation_status_var.set("設定已儲存")
+        self._log("資料庫設定已儲存，DatabaseManager已重新載入設定。")
+        messagebox.showinfo(
+            "儲存完成",
+            "資料庫設定已成功儲存。",
+            parent=self,
+        )
+
+    def test_connection(self) -> None:
+        """呼叫DatabaseManager測試資料庫連線。"""
+        self.connection_status_var.set("測試中…")
+        self._run_manager_action(
+            status_text="正在測試資料庫連線…",
+            action=self.database_manager.test_connection,
+            callback=self._on_test_connection_finished,
         )
 
     def ensure_tables(self) -> None:
-        """透過DatabaseManager建立必要資料表。"""
-        if not self.save_settings(show_message=False):
-            return
-
-        self._run_background(
-            operation_name="建立資料表",
-            target=self.database_manager.ensure_tables,
-            on_success=lambda result: self._on_simple_success(
-                "資料表建立完成", result
-            ),
-            on_error=lambda exc: self._on_simple_error("資料表建立失敗", exc),
+        """呼叫DatabaseManager建立必要資料表。"""
+        self._run_manager_action(
+            status_text="正在確認並建立資料表…",
+            action=self.database_manager.ensure_tables,
+            callback=self._on_ensure_tables_finished,
         )
 
     def start_auto_write(self) -> None:
-        """啟動DatabaseManager自動寫入。"""
-        if not self.save_settings(show_message=False):
-            return
-        if not self.enable_var.get():
-            messagebox.showwarning("尚未啟用", "請先勾選「啟用資料庫功能」。")
-            return
-
-        try:
-            result = self.database_manager.start_auto_write()
-            if result is False:
-                raise RuntimeError("DatabaseManager回報啟動失敗")
-            self._auto_write_running = True
-            self.auto_write_status_var.set("執行中")
-            self.operation_status_var.set("自動上傳已啟動")
-            self._log("資料庫自動上傳已啟動")
-            self.refresh_status()
-            self.refresh_all()
-        except Exception as exc:
-            self._auto_write_running = False
-            self.auto_write_status_var.set("啟動失敗")
-            self.operation_status_var.set(f"啟動失敗：{exc}")
-            self._log(f"資料庫自動上傳啟動失敗：{exc}")
-            messagebox.showerror("啟動失敗", f"無法啟動自動上傳：\n{exc}")
+        """呼叫DatabaseManager啟動自動上傳。"""
+        self._run_manager_action(
+            status_text="正在啟動自動上傳…",
+            action=self.database_manager.start_auto_write,
+            callback=self._on_start_auto_write_finished,
+        )
 
     def stop_auto_write(self) -> None:
-        """停止DatabaseManager自動寫入。"""
-        try:
-            result = self.database_manager.stop_auto_write()
-            if result is False:
-                raise RuntimeError("DatabaseManager回報停止失敗")
-            self._auto_write_running = False
-            self.auto_write_status_var.set("已停止")
-            self.operation_status_var.set("自動上傳已停止")
-            self._log("資料庫自動上傳已停止")
-            self.refresh_status()
-            self.refresh_all()
-        except Exception as exc:
-            self.operation_status_var.set(f"停止失敗：{exc}")
-            self._log(f"資料庫自動上傳停止失敗：{exc}")
-            messagebox.showerror("停止失敗", f"無法停止自動上傳：\n{exc}")
-
-    def refresh_status(self) -> None:
-        """更新自動上傳狀態與按鈕可用狀態。"""
-        running = self._detect_auto_write_running()
-        self._auto_write_running = running
-        self.auto_write_status_var.set("執行中" if running else "已停止")
-
-        if self._busy:
-            for button in self._action_buttons:
-                button.configure(state="disabled")
-            return
-
-        self.save_button.configure(state="normal")
-        self.test_button.configure(state="normal")
-        self.ensure_button.configure(state="normal")
-        self.start_button.configure(state="disabled" if running else "normal")
-        self.stop_button.configure(state="normal" if running else "disabled")
+        """呼叫DatabaseManager停止自動上傳。"""
+        self._run_manager_action(
+            status_text="正在停止自動上傳…",
+            action=self.database_manager.stop_auto_write,
+            callback=self._on_stop_auto_write_finished,
+        )
 
     def _collect_database_config(self) -> Dict[str, Any]:
+        """驗證UI欄位並建立database設定字典。"""
         host = self.host_var.get().strip()
-        user = self.user_var.get().strip()
-        database_name = self.database_var.get().strip()
         charset = self.charset_var.get().strip()
 
         if not host:
             raise ValueError("主機位址不可為空白。")
-        if not user:
-            raise ValueError("使用者名稱不可為空白。")
-        if not database_name:
-            raise ValueError("資料庫名稱不可為空白。")
         if not charset:
             raise ValueError("字元編碼不可為空白。")
 
@@ -385,181 +365,442 @@ class DatabasePage(ttk.Frame):
             port = int(self.port_var.get().strip())
         except ValueError as exc:
             raise ValueError("連接埠必須是整數。") from exc
+
         if not 1 <= port <= 65535:
             raise ValueError("連接埠必須介於1到65535。")
 
         try:
-            connect_timeout = int(self.connect_timeout_var.get().strip())
+            connect_timeout_number = float(
+                self.connect_timeout_var.get().strip()
+            )
         except ValueError as exc:
-            raise ValueError("連線逾時必須是整數秒數。") from exc
-        if connect_timeout < 1:
-            raise ValueError("連線逾時必須大於或等於1秒。")
+            raise ValueError("連線逾時必須是數字。") from exc
+
+        if connect_timeout_number <= 0:
+            raise ValueError("連線逾時必須大於0秒。")
+
+        connect_timeout: Any
+        if connect_timeout_number.is_integer():
+            connect_timeout = int(connect_timeout_number)
+        else:
+            connect_timeout = connect_timeout_number
 
         return {
             "enable": bool(self.enable_var.get()),
             "host": host,
             "port": port,
-            "user": user,
+            "user": self.user_var.get().strip(),
             "password": self.password_var.get(),
-            "database": database_name,
+            "database": self.database_var.get().strip(),
             "charset": charset,
             "connect_timeout": connect_timeout,
             "write_history": bool(self.write_history_var.get()),
             "write_latest": bool(self.write_latest_var.get()),
-            "write_only_on_change": bool(self.write_only_on_change_var.get()),
+            "write_only_on_change": bool(
+                self.write_only_on_change_var.get()
+            ),
         }
+
+    def _get_database_config(self) -> Dict[str, Any]:
+        """相容常見ConfigManager讀取介面。"""
+        manager = self.config_manager
+
+        get_section = getattr(manager, "get_section", None)
+        if callable(get_section):
+            section = get_section("database")
+            return dict(section) if isinstance(section, dict) else {}
+
+        get_config = getattr(manager, "get_config", None)
+        if callable(get_config):
+            config = get_config()
+            if isinstance(config, dict):
+                section = config.get("database", {})
+                return dict(section) if isinstance(section, dict) else {}
+
+        get_value = getattr(manager, "get", None)
+        if callable(get_value):
+            try:
+                section = get_value("database", {})
+            except TypeError:
+                section = get_value("database")
+            return dict(section) if isinstance(section, dict) else {}
+
+        config = getattr(manager, "config", None)
+        if isinstance(config, dict):
+            section = config.get("database", {})
+            return dict(section) if isinstance(section, dict) else {}
+
+        raise AttributeError("ConfigManager未提供可用的設定讀取介面。")
+
+    def _save_database_config(self, database_config: Dict[str, Any]) -> None:
+        """相容常見ConfigManager寫入與儲存介面。"""
+        manager = self.config_manager
+
+        update_section = getattr(manager, "update_section", None)
+        if callable(update_section):
+            update_section("database", database_config)
+            self._call_save_without_arguments()
+            return
+
+        set_section = getattr(manager, "set_section", None)
+        if callable(set_section):
+            set_section("database", database_config)
+            self._call_save_without_arguments()
+            return
+
+        config = self._get_full_config()
+        config["database"] = database_config
+
+        save_config = getattr(manager, "save_config", None)
+        if callable(save_config):
+            try:
+                save_config(config)
+            except TypeError:
+                self._replace_manager_config(config)
+                save_config()
+            return
+
+        save = getattr(manager, "save", None)
+        if callable(save):
+            try:
+                save(config)
+            except TypeError:
+                self._replace_manager_config(config)
+                save()
+            return
+
+        set_value = getattr(manager, "set", None)
+        if callable(set_value):
+            set_value("database", database_config)
+            self._call_save_without_arguments()
+            return
+
+        if isinstance(getattr(manager, "config", None), dict):
+            self._replace_manager_config(config)
+            self._call_save_without_arguments()
+            return
+
+        raise AttributeError("ConfigManager未提供可用的設定儲存介面。")
 
     def _get_full_config(self) -> Dict[str, Any]:
         manager = self.config_manager
-        config: Any
 
-        if hasattr(manager, "get_config"):
-            config = manager.get_config()
-        elif hasattr(manager, "load_config"):
-            config = manager.load_config()
-        elif hasattr(manager, "config"):
-            config = manager.config
-        elif isinstance(manager, dict):
-            config = manager
-        else:
-            raise AttributeError("ConfigManager未提供可讀取設定的公開介面。")
+        get_config = getattr(manager, "get_config", None)
+        if callable(get_config):
+            config = get_config()
+            return dict(config) if isinstance(config, dict) else {}
 
-        if config is None:
-            return {}
-        if not isinstance(config, dict):
-            raise TypeError("ConfigManager回傳的設定必須是dict。")
-        return copy.deepcopy(config)
+        config = getattr(manager, "config", None)
+        if isinstance(config, dict):
+            return dict(config)
 
-    def _save_full_config(self, config: Dict[str, Any]) -> None:
-        manager = self.config_manager
+        load_config = getattr(manager, "load_config", None)
+        if callable(load_config):
+            config = load_config()
+            return dict(config) if isinstance(config, dict) else {}
 
-        if hasattr(manager, "save_config"):
-            try:
-                manager.save_config(config)
-            except TypeError:
-                if hasattr(manager, "config"):
-                    manager.config = config
-                manager.save_config()
-            return
+        load = getattr(manager, "load", None)
+        if callable(load):
+            config = load()
+            return dict(config) if isinstance(config, dict) else {}
 
-        if hasattr(manager, "update_config"):
-            manager.update_config(config)
-            return
+        return {}
 
-        if hasattr(manager, "set_config"):
-            manager.set_config(config)
-            if hasattr(manager, "save"):
-                manager.save()
-            return
+    def _replace_manager_config(self, config: Dict[str, Any]) -> None:
+        current = getattr(self.config_manager, "config", None)
+        if not isinstance(current, dict):
+            raise AttributeError("ConfigManager沒有可更新的config字典。")
+        current.clear()
+        current.update(config)
 
-        if isinstance(manager, dict):
-            manager.clear()
-            manager.update(config)
-            return
+    def _call_save_without_arguments(self) -> None:
+        for method_name in ("save_config", "save"):
+            method = getattr(self.config_manager, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except TypeError:
+                    continue
+                return
 
-        raise AttributeError("ConfigManager未提供可儲存設定的公開介面。")
-
-    def _run_background(
+    def _run_manager_action(
         self,
-        operation_name: str,
-        target: Callable[[], Any],
-        on_success: Callable[[Any], None],
-        on_error: Callable[[Exception], None],
+        status_text: str,
+        action: Callable[[], Any],
+        callback: Callable[[Any, Optional[BaseException]], None],
     ) -> None:
-        if self._busy:
+        """在背景執行DatabaseManager操作，避免凍結Tkinter。"""
+        if self._operation_running:
+            messagebox.showwarning(
+                "操作進行中",
+                "目前已有資料庫操作正在執行，請稍後再試。",
+                parent=self,
+            )
             return
 
-        self._busy = True
-        self.operation_status_var.set(f"{operation_name}中...")
-        self.refresh_status()
+        self._operation_running = True
+        self.operation_status_var.set(status_text)
+        self._set_buttons_enabled(False)
 
         def worker() -> None:
+            result: Any = None
+            error: Optional[BaseException] = None
             try:
-                result = target()
-                if result is False:
-                    raise RuntimeError(f"{operation_name}回報失敗")
-                self.after(0, lambda: self._finish_background(on_success, result))
-            except Exception as exc:
-                self.after(0, lambda error=exc: self._finish_background(on_error, error))
+                result = action()
+            except BaseException as exc:
+                error = exc
+
+            try:
+                self.after(
+                    0,
+                    lambda: self._finish_manager_action(
+                        callback,
+                        result,
+                        error,
+                    ),
+                )
+            except tk.TclError:
+                return
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_background(
+    def _finish_manager_action(
         self,
-        callback: Callable[[Any], None],
-        value: Any,
+        callback: Callable[[Any, Optional[BaseException]], None],
+        result: Any,
+        error: Optional[BaseException],
     ) -> None:
-        self._busy = False
-        callback(value)
-        self.refresh_status()
+        self._operation_running = False
+        self._set_buttons_enabled(True)
+        callback(result, error)
 
-    def _on_connection_test_success(self, result: Any) -> None:
-        detail = self._result_message(result)
-        self.connection_status_var.set("連線成功")
-        self.operation_status_var.set(
-            f"資料庫連線成功{f'：{detail}' if detail else ''}"
+    def _on_test_connection_finished(
+        self,
+        result: Any,
+        error: Optional[BaseException],
+    ) -> None:
+        success, message = self._normalise_result(
+            result,
+            error,
+            "資料庫連線成功",
+            "資料庫連線失敗",
         )
-        self._log("資料庫連線測試成功")
-        messagebox.showinfo("連線成功", "資料庫連線測試成功。")
-
-    def _on_connection_test_error(self, exc: Exception) -> None:
-        self.connection_status_var.set("連線失敗")
-        self.operation_status_var.set(f"資料庫連線失敗：{exc}")
-        self._log(f"資料庫連線測試失敗：{exc}")
-        messagebox.showerror("連線失敗", f"資料庫連線測試失敗：\n{exc}")
-
-    def _on_simple_success(self, title: str, result: Any) -> None:
-        detail = self._result_message(result)
-        self.operation_status_var.set(
-            f"{title}{f'：{detail}' if detail else ''}"
+        self.connection_status_var.set(
+            "連線成功" if success else "連線失敗"
         )
-        self._log(title)
-        messagebox.showinfo(title, title)
+        self.operation_status_var.set(message)
+        self._log(message)
 
-    def _on_simple_error(self, title: str, exc: Exception) -> None:
-        self.operation_status_var.set(f"{title}：{exc}")
-        self._log(f"{title}：{exc}")
-        messagebox.showerror(title, f"{title}：\n{exc}")
+        dialog = messagebox.showinfo if success else messagebox.showerror
+        dialog("測試連線", message, parent=self)
 
-    def _detect_auto_write_running(self) -> bool:
+    def _on_ensure_tables_finished(
+        self,
+        result: Any,
+        error: Optional[BaseException],
+    ) -> None:
+        success, message = self._normalise_result(
+            result,
+            error,
+            "資料表確認與建立完成",
+            "資料表建立失敗",
+        )
+        self.operation_status_var.set(message)
+        self._log(message)
+
+        dialog = messagebox.showinfo if success else messagebox.showerror
+        dialog("資料表作業", message, parent=self)
+
+    def _on_start_auto_write_finished(
+        self,
+        result: Any,
+        error: Optional[BaseException],
+    ) -> None:
+        success, message = self._normalise_result(
+            result,
+            error,
+            "自動上傳已啟動",
+            "啟動自動上傳失敗",
+        )
+        self._local_auto_write_running = success
+        self.auto_write_status_var.set(
+            "執行中" if success else "啟動失敗"
+        )
+        self.operation_status_var.set(message)
+        self._log(message)
+
+        if not success:
+            messagebox.showerror("自動上傳", message, parent=self)
+
+    def _on_stop_auto_write_finished(
+        self,
+        result: Any,
+        error: Optional[BaseException],
+    ) -> None:
+        success, message = self._normalise_result(
+            result,
+            error,
+            "自動上傳已停止",
+            "停止自動上傳失敗",
+        )
+        if success:
+            self._local_auto_write_running = False
+        self.auto_write_status_var.set(
+            "已停止" if success else "停止失敗"
+        )
+        self.operation_status_var.set(message)
+        self._log(message)
+
+        if not success:
+            messagebox.showerror("自動上傳", message, parent=self)
+
+    def _normalise_result(
+        self,
+        result: Any,
+        error: Optional[BaseException],
+        success_message: str,
+        failure_message: str,
+    ) -> Tuple[bool, str]:
+        """統一DatabaseManager可能使用的回傳格式。"""
+        if error is not None:
+            return False, f"{failure_message}：{error}"
+
+        if isinstance(result, tuple) and result:
+            success = bool(result[0])
+            detail = str(result[1]) if len(result) > 1 and result[1] else ""
+            return (
+                success,
+                detail or (success_message if success else failure_message),
+            )
+
+        if isinstance(result, dict):
+            status = result.get(
+                "success",
+                result.get("ok", result.get("status")),
+            )
+            success = self._as_bool(status) if status is not None else True
+            detail = result.get("message") or result.get("error") or ""
+            return (
+                success,
+                str(detail) or (
+                    success_message if success else failure_message
+                ),
+            )
+
+        if isinstance(result, bool):
+            return (
+                result,
+                success_message if result else failure_message,
+            )
+
+        if isinstance(result, str):
+            text = result.strip()
+            lowered = text.lower()
+            failed = any(
+                keyword in lowered
+                for keyword in ("fail", "error", "失敗", "錯誤")
+            )
+            return (
+                not failed,
+                text or (failure_message if failed else success_message),
+            )
+
+        if result is None:
+            return True, success_message
+
+        success = bool(result)
+        return (
+            success,
+            success_message if success else failure_message,
+        )
+
+    def _schedule_status_refresh(self) -> None:
+        self._refresh_auto_write_status()
+        try:
+            self._status_after_id = self.after(
+                1000,
+                self._schedule_status_refresh,
+            )
+        except tk.TclError:
+            self._status_after_id = None
+
+    def _refresh_auto_write_status(self) -> None:
+        running = self._query_auto_write_status()
+        if running is None:
+            running = self._local_auto_write_running
+
+        self.auto_write_status_var.set(
+            "執行中" if running else "已停止"
+        )
+
+    def _query_auto_write_status(self) -> Optional[bool]:
+        """在不要求額外公開介面的前提下讀取管理器狀態。"""
         manager = self.database_manager
-        for method_name in ("is_auto_write_running", "is_running"):
+
+        for method_name in (
+            "is_auto_write_running",
+            "is_auto_writing",
+            "is_running",
+        ):
             method = getattr(manager, method_name, None)
             if callable(method):
                 try:
                     return bool(method())
                 except Exception:
-                    pass
+                    return None
 
         for attribute_name in (
             "auto_write_running",
+            "auto_writing",
             "_auto_write_running",
-            "running",
-            "_running",
         ):
             if hasattr(manager, attribute_name):
-                try:
-                    return bool(getattr(manager, attribute_name))
-                except Exception:
-                    pass
+                return bool(getattr(manager, attribute_name))
 
-        return self._auto_write_running
+        return None
 
-    @staticmethod
-    def _result_message(result: Any) -> str:
-        if result is None or result is True:
-            return ""
-        if isinstance(result, tuple) and len(result) >= 2:
-            return str(result[1])
-        if isinstance(result, dict):
-            for key in ("message", "detail", "status"):
-                if key in result:
-                    return str(result[key])
-            return ""
-        return str(result)
+    def _set_buttons_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for button in (
+            self.save_button,
+            self.test_button,
+            self.ensure_tables_button,
+            self.start_button,
+            self.stop_button,
+        ):
+            button.configure(state=state)
 
     def _log(self, message: str) -> None:
         try:
             self.log_func(message)
         except Exception:
             pass
+
+    @staticmethod
+    def _as_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "enable",
+                "enabled",
+                "啟用",
+                "是",
+            }
+        return bool(value)
+
+    def destroy(self) -> None:
+        """取消狀態更新排程後銷毀頁面。"""
+        if self._status_after_id is not None:
+            try:
+                self.after_cancel(self._status_after_id)
+            except tk.TclError:
+                pass
+            self._status_after_id = None
+        super().destroy()
