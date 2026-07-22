@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import importlib
 import inspect
 import queue
@@ -357,7 +358,9 @@ class App(tk.Tk):
     @staticmethod
     def _call_maybe_async(method) -> None:
         result = method()
-        if inspect.isawaitable(result):
+        if isinstance(result, concurrent.futures.Future):
+            result.result(timeout=10)
+        elif inspect.isawaitable(result):
             asyncio.run(result)
 
     def on_close(self) -> None:
@@ -368,10 +371,16 @@ class App(tk.Tk):
         self.title("多協定PLC HMI－正在關閉")
         self.log_func("開始停止通訊服務並關閉主程式", "INFO")
 
+        opcua_stop_method = getattr(
+            self.opcua_manager,
+            "shutdown",
+            self.opcua_manager.disconnect_all,
+        )
+
         def cleanup_worker() -> None:
             cleanup_steps = (
                 ("停止Modbus輪詢", self.modbus_manager.stop_polling),
-                ("OPC UA全部斷線", self.opcua_manager.disconnect_all),
+                ("停止OPC UA服務", opcua_stop_method),
                 ("停止資料庫自動上傳", self.database_manager.stop_auto_write),
             )
             for label, method in cleanup_steps:
@@ -393,7 +402,7 @@ class App(tk.Tk):
         ).start()
 
         # 避免第三方通訊函式永久阻塞而無法關閉視窗。
-        self._force_close_after_id = self.after(5000, self._final_destroy)
+        self._force_close_after_id = self.after(12000, self._final_destroy)
 
     def _final_destroy(self) -> None:
         if self._log_after_id is not None:
