@@ -118,6 +118,94 @@
       }
     ]
   },
+  "modbus_tcp": {
+    "enable": false,
+    "timeout": 1.0,
+    "poll_interval": 1.0,
+    "default_port": 502,
+    "devices": [
+      {
+        "enable": true,
+        "name": "範例Modbus_TCP_PLC_1",
+        "host": "192.168.1.10",
+        "port": 502,
+        "unit_id": 1,
+        "timeout": 1.0,
+        "points": [
+          {
+            "enable": true,
+            "name": "速度設定值",
+            "type": "holding_register",
+            "address": 0,
+            "count": 1,
+            "data_type": "UInt16",
+            "writable": true,
+            "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "實際溫度",
+            "type": "input_register",
+            "address": 10,
+            "count": 2,
+            "data_type": "Float32_ABCD",
+            "writable": false,
+            "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "啟動命令",
+            "type": "coil",
+            "address": 0,
+            "count": 1,
+            "data_type": "Bool",
+            "writable": true,
+            "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "安全門狀態",
+            "type": "discrete_input",
+            "address": 0,
+            "count": 1,
+            "data_type": "Bool",
+            "writable": false,
+            "db_enable": true
+          }
+        ]
+      },
+      {
+        "enable": true,
+        "name": "範例Modbus_TCP_PLC_2",
+        "host": "192.168.1.20",
+        "port": 502,
+        "unit_id": 1,
+        "timeout": 1.0,
+        "points": [
+          {
+            "enable": true,
+            "name": "生產計數",
+            "type": "holding_register",
+            "address": 100,
+            "count": 2,
+            "data_type": "UInt32_ABCD",
+            "writable": true,
+            "db_enable": true
+          },
+          {
+            "enable": true,
+            "name": "警報狀態",
+            "type": "discrete_input",
+            "address": 20,
+            "count": 1,
+            "data_type": "Bool",
+            "writable": false,
+            "db_enable": true
+          }
+        ]
+      }
+    ]
+  },
   "opcua": {
     "enable": false,
     "servers": [
