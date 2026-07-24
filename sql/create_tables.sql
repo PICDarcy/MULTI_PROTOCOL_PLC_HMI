@@ -1,11 +1,11 @@
 -- MULTI_PROTOCOL_PLC_HMI資料表
 -- 請先建立並選擇目標資料庫後再執行本檔案。
--- protocol欄位固定使用MODBUS_RTU或OPCUA。
+-- protocol欄位固定使用MODBUS_RTU、MODBUS_TCP或OPCUA。
 
 CREATE TABLE IF NOT EXISTS plc_point_history (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '歷史資料流水號',
     point_key VARCHAR(255) NOT NULL COMMENT '點位唯一識別鍵',
-    protocol VARCHAR(32) NOT NULL COMMENT '通訊協定：MODBUS_RTU或OPCUA',
+    protocol VARCHAR(32) NOT NULL COMMENT '通訊協定：MODBUS_RTU、MODBUS_TCP或OPCUA',
     source_name VARCHAR(128) NOT NULL DEFAULT '' COMMENT '資料來源名稱',
     device_name VARCHAR(128) NOT NULL DEFAULT '' COMMENT '設備或Server名稱',
     point_name VARCHAR(128) NOT NULL DEFAULT '' COMMENT '點位顯示名稱',
@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS plc_point_history (
 
 CREATE TABLE IF NOT EXISTS plc_point_latest (
     point_key VARCHAR(255) NOT NULL COMMENT '點位唯一識別鍵',
-    protocol VARCHAR(32) NOT NULL COMMENT '通訊協定：MODBUS_RTU或OPCUA',
+    protocol VARCHAR(32) NOT NULL COMMENT '通訊協定：MODBUS_RTU、MODBUS_TCP或OPCUA',
     source_name VARCHAR(128) NOT NULL DEFAULT '' COMMENT '資料來源名稱',
     device_name VARCHAR(128) NOT NULL DEFAULT '' COMMENT '設備或Server名稱',
     point_name VARCHAR(128) NOT NULL DEFAULT '' COMMENT '點位顯示名稱',

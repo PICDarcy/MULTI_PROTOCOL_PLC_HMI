@@ -26,10 +26,12 @@ class OverviewPage(ttk.Frame):
         self.value_bus = app_context["value_bus"]
         self.database_manager = app_context["database_manager"]
         self.modbus_manager = app_context["modbus_manager"]
+        self.modbus_tcp_manager = app_context["modbus_tcp_manager"]
         self.opcua_manager = app_context["opcua_manager"]
         self.log_func = app_context["log_func"]
 
         self.modbus_status_var = tk.StringVar(value="讀取中…")
+        self.modbus_tcp_status_var = tk.StringVar(value="讀取中…")
         self.opcua_server_count_var = tk.StringVar(value="0")
         self.database_status_var = tk.StringVar(value="讀取中…")
         self.value_bus_count_var = tk.StringVar(value="0")
@@ -85,18 +87,24 @@ class OverviewPage(ttk.Frame):
         self._add_status_row(
             status_frame,
             1,
+            "Modbus TCP狀態",
+            self.modbus_tcp_status_var,
+        )
+        self._add_status_row(
+            status_frame,
+            2,
             "OPC UA Server數量",
             self.opcua_server_count_var,
         )
         self._add_status_row(
             status_frame,
-            2,
+            3,
             "資料庫狀態",
             self.database_status_var,
         )
         self._add_status_row(
             status_frame,
-            3,
+            4,
             "ValueBus最新點位數量",
             self.value_bus_count_var,
         )
@@ -113,6 +121,8 @@ class OverviewPage(ttk.Frame):
         actions: list[tuple[str, Callable[[], Any]]] = [
             ("啟動Modbus輪詢", self.modbus_manager.start_polling),
             ("停止Modbus輪詢", self.modbus_manager.stop_polling),
+            ("啟動Modbus TCP輪詢", self.modbus_tcp_manager.start_polling),
+            ("停止Modbus TCP輪詢", self.modbus_tcp_manager.stop_polling),
             ("OPC UA全部連線", self.opcua_manager.connect_all),
             ("OPC UA全部斷線", self.opcua_manager.disconnect_all),
             ("OPC UA全部訂閱", self.opcua_manager.subscribe_all),
@@ -163,6 +173,7 @@ class OverviewPage(ttk.Frame):
     def refresh(self) -> None:
         """更新所有狀態文字。"""
         self._refresh_modbus_status()
+        self._refresh_modbus_tcp_status()
         self._refresh_opcua_status()
         self._refresh_database_status()
         self._refresh_value_bus_status()
@@ -190,6 +201,20 @@ class OverviewPage(ttk.Frame):
 
         running_text = "輪詢中" if running else "已停止"
         self.modbus_status_var.set(f"{enabled_text}／{running_text}")
+
+    def _refresh_modbus_tcp_status(self) -> None:
+        enabled = self._read_enabled_setting("modbus_tcp", "MODBUS_TCP")
+        try:
+            running = bool(self.modbus_tcp_manager.is_running())
+        except Exception:
+            running = False
+        enabled_text = (
+            "啟用狀態未知"
+            if enabled is None
+            else ("已啟用" if enabled else "未啟用")
+        )
+        running_text = "輪詢中" if running else "已停止"
+        self.modbus_tcp_status_var.set(f"{enabled_text}／{running_text}")
 
     def _refresh_opcua_status(self) -> None:
         servers = self._read_opcua_servers()
@@ -242,12 +267,36 @@ class OverviewPage(ttk.Frame):
         def worker() -> None:
             try:
                 result = self._resolve_async_result(action())
+                if isinstance(result, dict):
+                    status = result.get(
+                        "success",
+                        result.get("ok", result.get("status")),
+                    )
+                    if status is not None and not self._to_bool(status):
+                        detail = (
+                            result.get("message")
+                            or result.get("error")
+                            or "操作失敗"
+                        )
+                        if result.get("cancelled"):
+                            self._write_log(
+                                "INFO",
+                                f"未執行：{action_name}，{detail}",
+                            )
+                            return
+                        raise RuntimeError(str(detail))
                 if (
                     isinstance(result, tuple)
                     and result
                     and result[0] is False
                 ):
                     detail = result[1] if len(result) > 1 else "操作失敗"
+                    if getattr(result, "cancelled", False):
+                        self._write_log(
+                            "INFO",
+                            f"未執行：{action_name}，{detail}",
+                        )
+                        return
                     raise RuntimeError(str(detail))
                 self._write_log("INFO", f"執行完成：{action_name}")
             except Exception as exc:

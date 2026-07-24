@@ -1,300 +1,551 @@
-"""Modbus TCP設定頁面。"""
+"""Modbus TCP設定頁，每台PLC各自設定連線端點。"""
 
 from __future__ import annotations
 
+import copy
 import json
-import threading
+from pathlib import Path
+from typing import Any, Dict, Optional
+
 import tkinter as tk
-from collections.abc import Mapping
 from tkinter import messagebox, ttk
-from typing import Any
 
+from .modbus_page import (
+    DEFAULT_POINT,
+    ModbusPage,
+    POINT_TYPES,
+    READ_ONLY_TYPES,
+    _ModalDialog,
+)
 
-DEFAULT_SECTION = {
+DEFAULT_TCP_CONFIG = {
     "enable": False,
-    "timeout": 1.0,
+    "timeout": 3.0,
     "poll_interval": 1.0,
-    "default_port": 502,
-    "devices": [
-        {
-            "enable": True,
-            "name": "範例Modbus_TCP_PLC",
-            "host": "192.168.1.10",
-            "port": 502,
-            "unit_id": 1,
-            "timeout": 1.0,
-            "points": [
-                {"enable": True, "name": "速度設定值", "type": "holding_register", "address": 0, "count": 1, "data_type": "UInt16", "writable": True, "db_enable": True},
-                {"enable": True, "name": "實際溫度", "type": "input_register", "address": 10, "count": 2, "data_type": "Float32_ABCD", "writable": False, "db_enable": True},
-                {"enable": True, "name": "啟動命令", "type": "coil", "address": 0, "count": 1, "data_type": "Bool", "writable": True, "db_enable": True},
-                {"enable": True, "name": "安全門狀態", "type": "discrete_input", "address": 0, "count": 1, "data_type": "Bool", "writable": False, "db_enable": True},
-            ],
-        }
-    ],
+    "devices": [],
+}
+DEFAULT_TCP_DEVICE = {
+    "enable": True,
+    "name": "PLC_1",
+    "host": "127.0.0.1",
+    "port": 502,
+    "station_id": 1,
+    "points": [],
 }
 
 
-class ModbusTcpPage(ttk.Frame):
-    """以JSON方式管理Modbus TCP設定，並提供啟停與讀取測試。"""
+class ModbusTcpPage(ModbusPage):
+    """Modbus TCP連線、PLC裝置與點位設定頁。"""
 
     def __init__(self, parent, app_context):
-        super().__init__(parent)
-
+        ttk.Frame.__init__(self, parent)
         self.app_context = app_context
-        self.config_manager = self._context_get("config_manager")
-        self.modbus_tcp_manager = self._context_get("modbus_tcp_manager")
-        self.log_func = self._context_get("log_func", lambda message: None)
-        self.refresh_all = self._context_get("refresh_all")
+        self.config_manager = self._ctx("config_manager")
+        self.modbus_manager = self._ctx("modbus_tcp_manager")
+        self.log_func = self._ctx("log_func", print)
+        self.refresh_all = self._ctx("refresh_all")
 
-        self._worker_lock = threading.Lock()
-        self._worker: threading.Thread | None = None
-        self._destroyed = False
+        self.config: Dict[str, Any] = copy.deepcopy(DEFAULT_TCP_CONFIG)
+        self.selected_device: Optional[int] = None
+        self.action_running = False
+        self.status_after_id: Optional[str] = None
 
-        self.status_var = tk.StringVar(value="就緒")
-        self.running_var = tk.StringVar(value="未知")
-        self.device_count_var = tk.StringVar(value="0")
-        self.point_count_var = tk.StringVar(value="0")
+        self.enable_var = tk.BooleanVar(value=False)
+        self.timeout_var = tk.StringVar(value="3.0")
+        self.poll_interval_var = tk.StringVar(value="1.0")
+        self.status_var = tk.StringVar(value="尚未載入設定")
+        self.running_var = tk.StringVar(value="輪詢狀態：未知")
 
         self._build_ui()
-        self.refresh()
-
-    def _context_get(self, name: str, default: Any = None) -> Any:
-        if isinstance(self.app_context, Mapping):
-            return self.app_context.get(name, default)
-        return getattr(self.app_context, name, default)
+        self.reload_settings(show_message=False, reload_manager=False)
+        self._poll_running_status()
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
+        title = ttk.Frame(self, padding=(10, 10, 10, 4))
+        title.grid(row=0, column=0, sticky="ew")
+        title.columnconfigure(0, weight=1)
+        ttk.Label(
+            title,
+            text="Modbus TCP設定",
+            font=("TkDefaultFont", 14, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(title, textvariable=self.running_var).grid(
+            row=0, column=1, sticky="e"
+        )
+        self._build_tcp_frame()
+        self._build_tree_area()
+        self._build_action_bar()
 
-        title_frame = ttk.Frame(self, padding=(8, 8, 8, 4))
-        title_frame.grid(row=0, column=0, sticky="ew")
-        title_frame.columnconfigure(0, weight=1)
-        ttk.Label(title_frame, text="Modbus TCP設定", font=("", 14, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Label(title_frame, text="支援多IP、多Port、多Unit ID，點位會發布為MODBUS_TCP。").grid(row=1, column=0, sticky="w", pady=(4, 0))
+    def _build_tcp_frame(self) -> None:
+        frame = ttk.LabelFrame(self, text="共用輪詢參數", padding=10)
+        frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(4, 8))
+        for column in (1, 3, 5):
+            frame.columnconfigure(column, weight=1)
+        ttk.Checkbutton(
+            frame,
+            text="啟用Modbus TCP",
+            variable=self.enable_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=4)
+        self._entry(frame, 0, 2, "逾時秒數", self.timeout_var)
+        self._entry(frame, 0, 4, "輪詢間隔秒數", self.poll_interval_var)
+        ttk.Label(
+            frame,
+            text="每台PLC的IP、TCP Port與Unit ID請在新增／修改PLC中設定。",
+        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(5, 0))
 
-        summary = ttk.LabelFrame(self, text="狀態", padding=8)
-        summary.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
-        ttk.Label(summary, text="輪詢：").grid(row=0, column=0, sticky="w")
-        ttk.Label(summary, textvariable=self.running_var).grid(row=0, column=1, sticky="w")
-        ttk.Label(summary, text="設備數：").grid(row=0, column=2, sticky="w", padx=(12, 0))
-        ttk.Label(summary, textvariable=self.device_count_var).grid(row=0, column=3, sticky="w")
-        ttk.Label(summary, text="點位數：").grid(row=0, column=4, sticky="w", padx=(12, 0))
-        ttk.Label(summary, textvariable=self.point_count_var).grid(row=0, column=5, sticky="w")
+    def _device_tree_specs(self):
+        return (
+            ("enable", "啟用", 50, tk.CENTER),
+            ("name", "PLC名稱", 110, tk.W),
+            ("host", "主機 / IP", 145, tk.W),
+            ("port", "TCP Port", 65, tk.CENTER),
+            ("station_id", "Unit ID", 60, tk.CENTER),
+        )
 
-        editor_frame = ttk.LabelFrame(self, text="modbus_tcp設定JSON", padding=8)
-        editor_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=4)
-        editor_frame.columnconfigure(0, weight=1)
-        editor_frame.rowconfigure(0, weight=1)
-        self.text = tk.Text(editor_frame, wrap="none", undo=True, font=("Consolas", 10))
-        y_scroll = ttk.Scrollbar(editor_frame, orient="vertical", command=self.text.yview)
-        x_scroll = ttk.Scrollbar(editor_frame, orient="horizontal", command=self.text.xview)
-        self.text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
-        self.text.grid(row=0, column=0, sticky="nsew")
-        y_scroll.grid(row=0, column=1, sticky="ns")
-        x_scroll.grid(row=1, column=0, sticky="ew")
+    def _device_tree_values(self, device: Dict[str, Any]):
+        return (
+            self._yes_no(device["enable"]),
+            device["name"],
+            device["host"],
+            device["port"],
+            device["station_id"],
+        )
 
-        button_frame = ttk.Frame(self, padding=(8, 4, 8, 8))
-        button_frame.grid(row=3, column=0, sticky="ew")
-        button_frame.columnconfigure(99, weight=1)
-        buttons = (
-            ("重新載入設定", self.refresh),
-            ("套用範例設定", self.load_example),
+    def _next_device_station_id(self) -> int:
+        # 不同IP的PLC通常都使用Unit ID 1。
+        return 1
+
+    def _show_device_dialog(
+        self,
+        title: str,
+        source: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        initial = copy.deepcopy(DEFAULT_TCP_DEVICE)
+        initial.update(copy.deepcopy(source))
+        if "host" not in source:
+            initial["host"] = getattr(
+                self,
+                "_legacy_host",
+                DEFAULT_TCP_DEVICE["host"],
+            )
+        if "port" not in source:
+            initial["port"] = getattr(
+                self,
+                "_legacy_port",
+                DEFAULT_TCP_DEVICE["port"],
+            )
+        return _TcpDeviceDialog(self, title, initial).show()
+
+    def _build_action_bar(self) -> None:
+        frame = ttk.Frame(self, padding=(10, 0, 10, 10))
+        frame.grid(row=3, column=0, sticky="ew")
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(frame, textvariable=self.status_var).grid(
+            row=0, column=0, sticky="w"
+        )
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=0, column=1, sticky="e")
+        for text, command in (
             ("儲存設定", self.save_settings),
-            ("重新載入Manager", self.reload_manager),
-            ("啟動輪詢", self.start_polling),
-            ("停止輪詢", self.stop_polling),
-            ("讀取一次", self.read_once),
-        )
-        for index, (text, command) in enumerate(buttons):
-            ttk.Button(button_frame, text=text, command=command).grid(row=0, column=index, padx=(0 if index == 0 else 6, 0), sticky="w")
-        ttk.Label(button_frame, textvariable=self.status_var).grid(row=0, column=99, sticky="e", padx=(12, 0))
-
-        note = (
-            "點位type支援holding_register、input_register、coil、discrete_input。\n"
-            "可寫入點位請設定writable=true；資料庫上傳可用db_enable控制。\n"
-            "常用data_type：UInt16、Int16、UInt32_ABCD、Int32_ABCD、Float32_ABCD、Bool、String。"
-        )
-        ttk.Label(self, text=note, padding=(8, 0, 8, 8), foreground="#555555").grid(row=4, column=0, sticky="w")
-
-    def refresh(self) -> None:
-        section = self._get_section()
-        self._set_editor(section)
-        self._update_summary(section)
-        self.status_var.set("已重新載入設定")
-
-    def refresh_data(self) -> None:
-        self.refresh()
-
-    def reload_data(self) -> None:
-        self.refresh()
-
-    def update_view(self) -> None:
-        self.refresh()
-
-    def _get_section(self) -> dict[str, Any]:
-        if self.config_manager is None:
-            return dict(DEFAULT_SECTION)
-        getter = getattr(self.config_manager, "get_section", None)
-        if callable(getter):
-            value = getter("modbus_tcp", {})
-            if isinstance(value, dict) and value:
-                return value
-        getter = getattr(self.config_manager, "get_config", None)
-        if callable(getter):
-            root = getter()
-            if isinstance(root, dict) and isinstance(root.get("modbus_tcp"), dict):
-                return dict(root["modbus_tcp"])
-        return dict(DEFAULT_SECTION)
-
-    def _set_editor(self, section: Mapping[str, Any]) -> None:
-        self.text.delete("1.0", "end")
-        self.text.insert("1.0", json.dumps(section, ensure_ascii=False, indent=2))
-
-    def _editor_json(self) -> dict[str, Any]:
-        text = self.text.get("1.0", "end").strip()
-        if not text:
-            raise ValueError("modbus_tcp設定不可空白")
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            raise ValueError("modbus_tcp根節點必須是JSON物件")
-        return data
-
-    def _update_summary(self, section: Mapping[str, Any] | None = None) -> None:
-        section = section if section is not None else self._get_section()
-        devices = [item for item in section.get("devices", []) if isinstance(item, Mapping)]
-        point_count = sum(len([point for point in device.get("points", []) if isinstance(point, Mapping)]) for device in devices)
-        running = False
-        if self.modbus_tcp_manager is not None:
-            checker = getattr(self.modbus_tcp_manager, "is_running", None)
-            if callable(checker):
-                try:
-                    running = bool(checker())
-                except Exception:
-                    running = False
-        self.running_var.set("執行中" if running else "停止")
-        self.device_count_var.set(str(len(devices)))
-        self.point_count_var.set(str(point_count))
-
-    def load_example(self) -> None:
-        self._set_editor(DEFAULT_SECTION)
-        self._update_summary(DEFAULT_SECTION)
-        self.status_var.set("已載入範例，尚未儲存")
+            ("重新載入設定", self.reload_settings),
+            ("啟動TCP輪詢", self.start_polling),
+            ("停止TCP輪詢", self.stop_polling),
+            ("讀取一次", self.read_all_once),
+        ):
+            ttk.Button(buttons, text=text, command=command).pack(
+                side=tk.LEFT, padx=4
+            )
 
     def save_settings(self) -> None:
         try:
-            data = self._editor_json()
-            self._validate_section(data)
-            updater = getattr(self.config_manager, "update_section", None)
-            if not callable(updater):
-                raise RuntimeError("ConfigManager未提供update_section()")
-            updater("modbus_tcp", data)
-            self.status_var.set("modbus_tcp設定已儲存")
-            self._log("Modbus TCP設定已儲存")
-            self._update_summary(data)
-            if callable(self.refresh_all):
-                self.refresh_all()
+            self._form_to_config()
+            self._validate_config()
+            self._save_config_json()
+            if self.modbus_manager is None:
+                raise RuntimeError("app_context未提供modbus_tcp_manager。")
+            self.modbus_manager.reload_config()
+            self._call_refresh_all()
+            self._status("Modbus TCP設定已儲存")
+            self._log("INFO", "已儲存Modbus TCP設定並重新載入管理器")
+            messagebox.showinfo(
+                "儲存完成",
+                "每台PLC的Modbus TCP連線設定已寫入config.json。",
+                parent=self,
+            )
         except Exception as exc:
+            self._status(f"儲存失敗：{exc}")
+            self._log("ERROR", f"儲存Modbus TCP設定失敗：{exc}")
             messagebox.showerror("儲存失敗", str(exc), parent=self)
 
-    def _validate_section(self, data: Mapping[str, Any]) -> None:
-        devices = data.get("devices", [])
-        if not isinstance(devices, list):
-            raise ValueError("devices必須是陣列")
-        for index, device in enumerate(devices, start=1):
-            if not isinstance(device, Mapping):
-                raise ValueError(f"第{index}個device必須是JSON物件")
-            if not str(device.get("host", device.get("ip", ""))).strip():
-                raise ValueError(f"第{index}個device缺少host")
-            int(device.get("port", data.get("default_port", 502)))
-            int(device.get("unit_id", device.get("station_id", 1)))
-            points = device.get("points", [])
-            if not isinstance(points, list):
-                raise ValueError(f"第{index}個device的points必須是陣列")
-            for point_index, point in enumerate(points, start=1):
-                if not isinstance(point, Mapping):
-                    raise ValueError(f"第{index}個device第{point_index}個point必須是JSON物件")
-                if str(point.get("type", "")).lower() not in {"holding_register", "input_register", "coil", "discrete_input"}:
-                    raise ValueError(f"第{index}個device第{point_index}個point type不支援：{point.get('type')}")
-                int(point.get("address", 0))
-                int(point.get("count", 1))
-
-    def reload_manager(self) -> None:
-        self._run_worker("重新載入Modbus TCP Manager", self._reload_manager_job)
-
-    def _reload_manager_job(self) -> str:
-        if self.modbus_tcp_manager is None:
-            raise RuntimeError("modbus_tcp_manager尚未建立")
-        result = self.modbus_tcp_manager.reload_config()
-        return f"重新載入完成：{result}"
-
-    def start_polling(self) -> None:
-        self._run_worker("啟動Modbus TCP輪詢", self._start_job)
-
-    def _start_job(self) -> str:
-        if self.modbus_tcp_manager is None:
-            raise RuntimeError("modbus_tcp_manager尚未建立")
-        return str(self.modbus_tcp_manager.start_polling())
-
-    def stop_polling(self) -> None:
-        self._run_worker("停止Modbus TCP輪詢", self._stop_job)
-
-    def _stop_job(self) -> str:
-        if self.modbus_tcp_manager is None:
-            raise RuntimeError("modbus_tcp_manager尚未建立")
-        return str(self.modbus_tcp_manager.stop_polling())
-
-    def read_once(self) -> None:
-        self._run_worker("讀取一次Modbus TCP", self._read_once_job)
-
-    def _read_once_job(self) -> str:
-        if self.modbus_tcp_manager is None:
-            raise RuntimeError("modbus_tcp_manager尚未建立")
-        result = self.modbus_tcp_manager.read_all_once()
-        return f"讀取完成：{result}"
-
-    def _run_worker(self, action_name: str, job) -> None:
-        with self._worker_lock:
-            if self._worker and self._worker.is_alive():
-                messagebox.showwarning("背景工作中", "已有一個Modbus TCP操作正在執行。", parent=self)
-                return
-            self.status_var.set(f"{action_name}中...")
-            self._worker = threading.Thread(target=self._worker_entry, args=(action_name, job), name="ModbusTcpPageWorker", daemon=True)
-            self._worker.start()
-
-    def _worker_entry(self, action_name: str, job) -> None:
-        error_text = ""
-        result_text = ""
+    def reload_settings(
+        self,
+        show_message: bool = True,
+        reload_manager: bool = True,
+    ) -> None:
         try:
-            result_text = str(job())
+            self._reload_config_manager()
+            self.config = self._normalize(self._read_modbus_section())
+            self.selected_device = 0 if self.config["devices"] else None
+            self._config_to_form()
+            self._refresh_devices()
+            if reload_manager and self.modbus_manager is not None:
+                self.modbus_manager.reload_config()
+            self._call_refresh_all()
+            self._status("已重新載入Modbus TCP設定")
+            if show_message:
+                messagebox.showinfo(
+                    "重新載入",
+                    "Modbus TCP設定已重新載入。",
+                    parent=self,
+                )
         except Exception as exc:
-            error_text = str(exc) or exc.__class__.__name__
+            self._status(f"重新載入失敗：{exc}")
+            self._log("ERROR", f"重新載入Modbus TCP設定失敗：{exc}")
+            if show_message:
+                messagebox.showerror("重新載入失敗", str(exc), parent=self)
 
-        def finish() -> None:
-            if self._destroyed:
+    def _form_to_config(self) -> None:
+        self.config.update(
+            {
+                "enable": bool(self.enable_var.get()),
+                "timeout": self._positive_float(
+                    self.timeout_var.get(), "逾時秒數"
+                ),
+                "poll_interval": self._positive_float(
+                    self.poll_interval_var.get(), "輪詢間隔秒數"
+                ),
+            }
+        )
+        # 尚無device時保留舊端點，供使用者第一次新增PLC時自動帶入。
+        if not self.config.get("devices") and getattr(
+            self, "_had_legacy_endpoint", False
+        ):
+            self.config["host"] = self._legacy_host
+            self.config["port"] = self._legacy_port
+        else:
+            self.config.pop("host", None)
+            self.config.pop("port", None)
+
+    def _config_to_form(self) -> None:
+        self.enable_var.set(bool(self.config["enable"]))
+        self.timeout_var.set(str(self.config["timeout"]))
+        self.poll_interval_var.set(str(self.config["poll_interval"]))
+
+    def _read_modbus_section(self) -> Dict[str, Any]:
+        if self.config_manager is not None:
+            value = self.config_manager.get_section("modbus_tcp", None)
+            if isinstance(value, dict):
+                return copy.deepcopy(value)
+        path = self._config_path()
+        if path.exists():
+            with path.open("r", encoding="utf-8") as file:
+                value = json.load(file).get("modbus_tcp")
+            if isinstance(value, dict):
+                return value
+        return copy.deepcopy(DEFAULT_TCP_CONFIG)
+
+    def _save_config_json(self) -> None:
+        if self.config_manager is not None:
+            setter = getattr(self.config_manager, "set_section", None)
+            if not callable(setter):
+                setter = getattr(self.config_manager, "set", None)
+            saver = getattr(self.config_manager, "save_config", None)
+            if not callable(saver):
+                saver = getattr(self.config_manager, "save", None)
+            if callable(setter) and callable(saver):
+                setter("modbus_tcp", copy.deepcopy(self.config))
+                saver()
                 return
-            self._update_summary()
-            if error_text:
-                self.status_var.set(f"{action_name}失敗")
-                self._log(f"{action_name}失敗：{error_text}", "ERROR")
-                messagebox.showerror(f"{action_name}失敗", error_text, parent=self)
+
+            update = getattr(self.config_manager, "update_section", None)
+            if callable(update):
+                update("modbus_tcp", copy.deepcopy(self.config))
+                return
+
+        path = Path(self._config_path())
+        full = {}
+        if path.exists():
+            with path.open("r", encoding="utf-8") as file:
+                full = json.load(file)
+        full["modbus_tcp"] = copy.deepcopy(self.config)
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(full, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+
+    def _normalize(self, raw: Any) -> Dict[str, Any]:
+        raw_config = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+        legacy_host = str(raw_config.get("host", "127.0.0.1") or "").strip()
+        legacy_port = self._to_int(raw_config.get("port"), 502)
+        self._legacy_host = legacy_host
+        self._legacy_port = legacy_port
+        self._had_legacy_endpoint = "host" in raw_config or "port" in raw_config
+
+        config = copy.deepcopy(DEFAULT_TCP_CONFIG)
+        config.update(raw_config)
+        config.pop("host", None)
+        config.pop("port", None)
+
+        devices = []
+        for device_index, source in enumerate(config.get("devices", [])):
+            if not isinstance(source, dict):
+                continue
+            device = copy.deepcopy(DEFAULT_TCP_DEVICE)
+            device.update(copy.deepcopy(source))
+            device["enable"] = bool(device.get("enable", True))
+            device["name"] = str(
+                device.get("name") or f"PLC_{device_index + 1}"
+            )
+            if "host" in source:
+                raw_host = source.get("host")
+            elif "ip" in source:
+                raw_host = source.get("ip")
             else:
-                self.status_var.set(result_text or f"{action_name}完成")
-                self._log(result_text or f"{action_name}完成")
+                raw_host = legacy_host
+            device["host"] = str(raw_host or "").strip()
+            device["port"] = self._to_int(
+                source.get("port", legacy_port),
+                legacy_port,
+            )
+            device.pop("ip", None)
+            device["station_id"] = self._to_int(
+                device.get("station_id"),
+                1,
+            )
 
+            points = []
+            for point_index, source_point in enumerate(device.get("points", [])):
+                if not isinstance(source_point, dict):
+                    continue
+                point = copy.deepcopy(DEFAULT_POINT)
+                point.update(copy.deepcopy(source_point))
+                point["enable"] = bool(point.get("enable", True))
+                point["name"] = str(
+                    point.get("name") or f"Point_{point_index + 1}"
+                )
+                point["type"] = str(
+                    point.get("type") or "holding_register"
+                )
+                point["address"] = self._to_int(point.get("address"), 0)
+                point["count"] = max(
+                    1,
+                    self._to_int(point.get("count"), 1),
+                )
+                point["data_type"] = str(
+                    point.get("data_type") or "uint16"
+                )
+                point["writable"] = bool(point.get("writable", False))
+                point["db_enable"] = bool(point.get("db_enable", False))
+                if point["type"] in READ_ONLY_TYPES:
+                    point["writable"] = False
+                points.append(point)
+            device["points"] = points
+            devices.append(device)
+        config["devices"] = devices
+        return config
+
+    def _validate_config(self) -> None:
+        names: set[str] = set()
+        endpoints: set[tuple[str, int, int]] = set()
+        for device in self.config["devices"]:
+            name_key = device["name"].casefold()
+            if name_key in names:
+                raise ValueError(f"PLC名稱重複：{device['name']}")
+            names.add(name_key)
+
+            host = str(device.get("host", "")).strip()
+            port = self._to_int(device.get("port"), 0)
+            station_id = self._to_int(device.get("station_id"), -1)
+            if not host:
+                raise ValueError(f"PLC「{device['name']}」主機/IP不可空白。")
+            if not 1 <= port <= 65535:
+                raise ValueError(
+                    f"PLC「{device['name']}」TCP Port必須介於1到65535。"
+                )
+            if not 1 <= station_id <= 247:
+                raise ValueError(
+                    f"PLC「{device['name']}」Unit ID必須介於1到247。"
+                )
+            endpoint_key = (host.casefold(), port, station_id)
+            if endpoint_key in endpoints:
+                raise ValueError(
+                    f"Modbus TCP端點與Unit ID重複："
+                    f"{host}:{port} / {station_id}"
+                )
+            endpoints.add(endpoint_key)
+
+            point_names: set[str] = set()
+            for point in device["points"]:
+                key = point["name"].casefold()
+                if key in point_names:
+                    raise ValueError(
+                        f"PLC「{device['name']}」點位名稱重複："
+                        f"{point['name']}"
+                    )
+                point_names.add(key)
+                if point["type"] not in POINT_TYPES:
+                    raise ValueError(
+                        f"點位「{point['name']}」使用不支援的type。"
+                    )
+                if point["address"] < 0 or point["count"] < 1:
+                    raise ValueError(
+                        f"點位「{point['name']}」位址或數量無效。"
+                    )
+
+    def _device_is_unique(
+        self,
+        candidate: Dict[str, Any],
+        ignore: Optional[int] = None,
+    ) -> bool:
+        candidate_endpoint = (
+            str(candidate.get("host", "")).strip().casefold(),
+            self._to_int(candidate.get("port"), 0),
+            self._to_int(candidate.get("station_id"), -1),
+        )
+        for index, device in enumerate(self.config["devices"]):
+            if index == ignore:
+                continue
+            if device["name"].casefold() == candidate["name"].casefold():
+                messagebox.showerror(
+                    "資料重複",
+                    f"PLC名稱「{candidate['name']}」已存在。",
+                    parent=self,
+                )
+                return False
+            endpoint = (
+                str(device.get("host", "")).strip().casefold(),
+                self._to_int(device.get("port"), 0),
+                self._to_int(device.get("station_id"), -1),
+            )
+            if endpoint == candidate_endpoint:
+                messagebox.showerror(
+                    "資料重複",
+                    "相同IP、TCP Port與Unit ID的PLC已存在。",
+                    parent=self,
+                )
+                return False
+        return True
+
+
+class _TcpDeviceDialog(_ModalDialog):
+    """Modbus TCP PLC連線參數編輯視窗。"""
+
+    def __init__(
+        self,
+        parent,
+        title: str,
+        source: Dict[str, Any],
+    ) -> None:
+        super().__init__(parent, title)
+        self.source = copy.deepcopy(source)
+        self.enable_var = tk.BooleanVar(value=bool(source.get("enable", True)))
+        self.name_var = tk.StringVar(value=str(source.get("name", "")))
+        self.host_var = tk.StringVar(value=str(source.get("host", "127.0.0.1")))
+        self.port_var = tk.StringVar(value=str(source.get("port", 502)))
+        self.station_var = tk.StringVar(value=str(source.get("station_id", 1)))
+
+        frame = ttk.Frame(self, padding=14)
+        frame.grid()
+        ttk.Checkbutton(
+            frame,
+            text="啟用此PLC",
+            variable=self.enable_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        fields = (
+            ("PLC名稱", ttk.Entry(frame, textvariable=self.name_var, width=30)),
+            ("主機 / IP", ttk.Entry(frame, textvariable=self.host_var, width=30)),
+            ("TCP Port", ttk.Entry(frame, textvariable=self.port_var, width=12)),
+            (
+                "Unit ID",
+                ttk.Spinbox(
+                    frame,
+                    textvariable=self.station_var,
+                    from_=1,
+                    to=247,
+                    width=10,
+                ),
+            ),
+        )
+        for row, (label, widget) in enumerate(fields, start=1):
+            ttk.Label(frame, text=label).grid(
+                row=row,
+                column=0,
+                sticky="e",
+                padx=(0, 8),
+                pady=5,
+            )
+            widget.grid(row=row, column=1, sticky="w", pady=5)
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(
+            row=5,
+            column=0,
+            columnspan=2,
+            sticky="e",
+            pady=(12, 0),
+        )
+        ttk.Button(buttons, text="確定", command=self._ok).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(buttons, text="取消", command=self._cancel).pack(side=tk.LEFT)
+        fields[0][1].focus_set()
+        self.bind("<Return>", lambda _event: self._ok())
+        self.bind("<Escape>", lambda _event: self._cancel())
+
+    def _ok(self) -> None:
+        name = self.name_var.get().strip()
+        host = self.host_var.get().strip()
+        if not name:
+            messagebox.showerror(
+                "輸入錯誤",
+                "PLC名稱不可為空白。",
+                parent=self,
+            )
+            return
+        if not host:
+            messagebox.showerror(
+                "輸入錯誤",
+                "主機/IP不可為空白。",
+                parent=self,
+            )
+            return
         try:
-            self.after(0, finish)
-        except (tk.TclError, RuntimeError):
-            pass
+            port = int(self.port_var.get())
+            station_id = int(self.station_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "輸入錯誤",
+                "TCP Port與Unit ID必須是整數。",
+                parent=self,
+            )
+            return
+        if not 1 <= port <= 65535:
+            messagebox.showerror(
+                "輸入錯誤",
+                "TCP Port必須介於1到65535。",
+                parent=self,
+            )
+            return
+        if not 1 <= station_id <= 247:
+            messagebox.showerror(
+                "輸入錯誤",
+                "Unit ID必須介於1到247。",
+                parent=self,
+            )
+            return
 
-    def _log(self, message: str, level: str = "INFO") -> None:
-        try:
-            self.log_func(message, level)
-        except TypeError:
-            self.log_func(message)
-        except Exception:
-            pass
-
-    def destroy(self) -> None:
-        self._destroyed = True
-        super().destroy()
+        result = copy.deepcopy(self.source)
+        result.update(
+            {
+                "enable": bool(self.enable_var.get()),
+                "name": name,
+                "host": host,
+                "port": port,
+                "station_id": station_id,
+                "points": copy.deepcopy(self.source.get("points", [])),
+            }
+        )
+        self.result = result
+        self.destroy()

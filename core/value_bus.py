@@ -92,3 +92,17 @@ class ValueBus:
         """清除所有最新點位值，但保留訂閱callback。"""
         with self._lock:
             self._latest.clear()
+
+    def remove(self, point_key: str) -> bool:
+        """移除單一已失效點位；回傳是否原本存在。"""
+        with self._lock:
+            return self._latest.pop(str(point_key), None) is not None
+
+    def remove_many(self, point_keys) -> int:
+        """批次移除設定已刪除或唯一鍵已變更的點位。"""
+        removed = 0
+        with self._lock:
+            for point_key in point_keys:
+                if self._latest.pop(str(point_key), None) is not None:
+                    removed += 1
+        return removed

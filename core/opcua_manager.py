@@ -495,7 +495,7 @@ class OpcuaMultiServerManager:
         server_name: str,
         node_id: str,
     ) -> dict[str, Any]:
-        client = self._require_connected(server_name)
+        client = await self._ensure_connected(server_name)
         node_id = self._canonical_node_id(node_id)
         config = self._configured_node_config(server_name, node_id)
         try:
@@ -519,7 +519,7 @@ class OpcuaMultiServerManager:
         value_text: Any,
         data_type: str,
     ) -> dict[str, Any]:
-        client = self._require_connected(server_name)
+        client = await self._ensure_connected(server_name)
         node_id = self._canonical_node_id(node_id)
         config = self._configured_node_config(server_name, node_id)
         node = client.get_node(node_id)
@@ -671,26 +671,23 @@ class OpcuaMultiServerManager:
                 self._node_configs.setdefault(server_name, {})[
                     node_id
                 ] = config
-                return {
-                    "server_name": server_name,
-                    "node_id": node_id,
-                    "subscribed": True,
-                    "already_subscribed": True,
-                }
-
-            node = client.get_node(node_id)
-            handle = await subscription.subscribe_data_change(node)
-            self._handles.setdefault(server_name, {})[node_id] = handle
-            self._node_configs.setdefault(server_name, {})[
-                node_id
-            ] = config
-            self._set_point_status(
-                server_name,
-                node_id,
-                "已訂閱",
-                "",
-                self._now(),
-            )
+                already_subscribed = True
+                node = client.get_node(node_id)
+            else:
+                already_subscribed = False
+                node = client.get_node(node_id)
+                handle = await subscription.subscribe_data_change(node)
+                self._handles.setdefault(server_name, {})[node_id] = handle
+                self._node_configs.setdefault(server_name, {})[
+                    node_id
+                ] = config
+                self._set_point_status(
+                    server_name,
+                    node_id,
+                    "已訂閱",
+                    "",
+                    self._now(),
+                )
 
         try:
             data_value = await node.read_data_value()
@@ -711,7 +708,7 @@ class OpcuaMultiServerManager:
             "server_name": server_name,
             "node_id": node_id,
             "subscribed": True,
-            "already_subscribed": False,
+            "already_subscribed": already_subscribed,
         }
 
     async def _unsubscribe_node(
@@ -835,7 +832,7 @@ class OpcuaMultiServerManager:
         server_name: str,
         node_id: str,
     ) -> list[dict[str, Any]]:
-        client = self._require_connected(server_name)
+        client = await self._ensure_connected(server_name)
         node_id = self._canonical_node_id(node_id)
         parent = client.get_node(node_id)
         parent_path = await self._read_path(parent, node_id)
@@ -861,7 +858,7 @@ class OpcuaMultiServerManager:
         only_variables: bool,
         include_ns0: bool,
     ) -> list[dict[str, Any]]:
-        client = self._require_connected(server_name)
+        client = await self._ensure_connected(server_name)
         start_node_id = self._canonical_node_id(start_node_id)
         max_depth = max(0, int(max_depth))
         max_nodes = max(1, int(max_nodes))
@@ -1367,6 +1364,12 @@ class OpcuaMultiServerManager:
                 f"OPC UA Server「{server_name}」尚未連線"
             )
         return client
+
+    async def _ensure_connected(self, server_name: str) -> Client:
+        """需要Client的操作會先自動連線，並保留真正的連線錯誤。"""
+        if not self.is_connected(server_name):
+            await self._connect_server(server_name)
+        return self._require_connected(server_name)
 
     def _canonical_node_id(self, node_id: Any) -> str:
         if hasattr(node_id, "to_string"):

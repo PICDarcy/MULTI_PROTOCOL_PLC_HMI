@@ -378,6 +378,8 @@ class ModbusRtuManager:
         with self._state_lock:
             if self._thread is thread:
                 self._thread = None
+        # thread已確認停止，清除舊的取消狀態，讓「讀取一次」可再次使用。
+        self._stop_event.clear()
         return "Modbus輪詢已停止"
 
     def is_running(self) -> bool:

@@ -334,11 +334,57 @@ class OpcuaBrowsePage(ttk.Frame):
             return
         try:
             added = self._add_rows_to_config(server_name, rows, subscribe=True)
-            self.status_var.set(f"已加入{added}個Node到監控設定")
-            if callable(self.refresh_all):
-                self.refresh_all()
         except Exception as exc:
             self._report_error("加入監控設定失敗", exc)
+            return
+
+        node_configs = [
+            self._row_to_node_config(row, subscribe=True)
+            for row in rows
+        ]
+        self._set_busy(
+            True,
+            f"已保存設定，正在訂閱{len(node_configs)}個Node",
+        )
+
+        def subscribe_all_selected() -> list[Any]:
+            return [
+                self._call_manager(
+                    "subscribe_node",
+                    server_name,
+                    node_config,
+                )
+                for node_config in node_configs
+            ]
+
+        self._run_in_background(
+            subscribe_all_selected,
+            on_success=lambda _result: self._monitor_add_done(
+                added,
+                len(node_configs),
+            ),
+            on_error=lambda exc: self._monitor_add_failed(added, exc),
+        )
+
+    def _monitor_add_done(self, added: int, subscribed: int) -> None:
+        self._set_busy(
+            False,
+            f"已新增{added}個監控設定並訂閱{subscribed}個Node",
+        )
+        if callable(self.refresh_all):
+            self.refresh_all()
+
+    def _monitor_add_failed(self, added: int, exc: BaseException) -> None:
+        self._set_busy(
+            False,
+            f"已新增{added}個監控設定，但訂閱失敗：{exc}",
+        )
+        if callable(self.refresh_all):
+            self.refresh_all()
+        self._report_error(
+            "加入監控後訂閱失敗",
+            exc,
+        )
 
     def subscribe_selected_node(self) -> None:
         row = self._selected_row()
@@ -562,7 +608,7 @@ class OpcuaBrowsePage(ttk.Frame):
 
             nodes = target_server.setdefault("nodes", [])
             existing = {
-                str(node.get("node_id", node.get("nodeId", "")))
+                str(node.get("node_id", node.get("nodeId", ""))): node
                 for node in nodes
                 if isinstance(node, Mapping)
             }
@@ -572,9 +618,13 @@ class OpcuaBrowsePage(ttk.Frame):
                 node_config = self._row_to_node_config(row, subscribe=subscribe)
                 node_id = str(node_config["node_id"])
                 if node_id in existing:
+                    existing_node = existing[node_id]
+                    if isinstance(existing_node, dict):
+                        existing_node["enable"] = True
+                        existing_node["subscribe"] = bool(subscribe)
                     continue
                 nodes.append(node_config)
-                existing.add(node_id)
+                existing[node_id] = node_config
                 added += 1
 
             update_section = getattr(self.config_manager, "update_section", None)

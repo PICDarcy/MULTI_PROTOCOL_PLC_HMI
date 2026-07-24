@@ -4,13 +4,45 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .data_model import PointValue
+
+
+class DatabaseCreationDeclinedError(RuntimeError):
+    """使用者選擇不建立缺少的資料庫。"""
+
+    def __init__(self, database_name: str):
+        self.database_name = database_name
+        super().__init__(f'未建立資料庫"{database_name}"')
+
+
+class DatabaseActionResult(tuple):
+    """維持(bool, message)解包相容性，並攜帶額外操作狀態。"""
+
+    cancelled: bool
+    reason: str
+    database: str
+
+    def __new__(
+        cls,
+        success: bool,
+        message: str,
+        *,
+        cancelled: bool = False,
+        reason: str = "",
+        database: str = "",
+    ):
+        result = super().__new__(cls, (bool(success), str(message)))
+        result.cancelled = bool(cancelled)
+        result.reason = str(reason)
+        result.database = str(database)
+        return result
 
 
 class DatabaseManager:
@@ -33,6 +65,8 @@ class DatabaseManager:
         self._auto_write_running = False
         self._last_signature: dict[str, tuple[Any, ...]] = {}
         self._config: dict[str, Any] = {}
+        self._database_creation_lock = threading.Lock()
+        self._missing_database_handler: Callable[[str], bool] | None = None
         self.reload_config()
 
     @property
@@ -92,31 +126,227 @@ class DatabaseManager:
             self._config = self._config_snapshot()
             return dict(self._config)
 
-    def _connect(self):
+    def set_missing_database_handler(
+        self,
+        handler: Callable[[str], bool] | None,
+    ) -> None:
+        """設定資料庫不存在時的詢問函式；回傳True才允許建立。"""
+        if handler is not None and not callable(handler):
+            raise TypeError("handler必須是可呼叫物件或None")
+        with self._lock:
+            self._missing_database_handler = handler
+
+    @staticmethod
+    def _database_name(config: dict[str, Any]) -> str:
+        database = str(config.get("database", "")).strip()
+        if not database:
+            raise ValueError("database.database不可為空白")
+        if len(database) > 64:
+            raise ValueError("資料庫名稱不可超過64個字元")
+        if "\x00" in database:
+            raise ValueError("資料庫名稱不可包含NUL字元")
+        if any(ord(character) > 0xFFFF for character in database):
+            raise ValueError("資料庫名稱不可包含MySQL不支援的字元")
+        return database
+
+    @staticmethod
+    def _charset(config: dict[str, Any]) -> str:
+        charset = str(config.get("charset", "utf8mb4")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_]+", charset):
+            raise ValueError("資料庫字元編碼只能包含英文字母、數字與底線")
+        return charset
+
+    @staticmethod
+    def _quote_identifier(identifier: str) -> str:
+        return f"`{identifier.replace('`', '``')}`"
+
+    @classmethod
+    def _connection_kwargs(
+        cls,
+        config: dict[str, Any],
+        *,
+        select_database: bool,
+        autocommit: bool = False,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "host": str(config.get("host", "127.0.0.1")),
+            "port": int(config.get("port", 3306)),
+            "user": str(config.get("user", "")),
+            "password": str(config.get("password", "")),
+            "charset": cls._charset(config),
+            "connect_timeout": max(
+                1,
+                int(float(config.get("connect_timeout", 5))),
+            ),
+            "read_timeout": max(
+                1,
+                int(
+                    float(
+                        config.get(
+                            "read_timeout",
+                            config.get("connect_timeout", 5),
+                        )
+                    )
+                ),
+            ),
+            "write_timeout": max(
+                1,
+                int(
+                    float(
+                        config.get(
+                            "write_timeout",
+                            config.get("connect_timeout", 5),
+                        )
+                    )
+                ),
+            ),
+            "autocommit": autocommit,
+        }
+        if select_database:
+            kwargs["database"] = cls._database_name(config)
+        return kwargs
+
+    @staticmethod
+    def _is_unknown_database_error(exc: BaseException, pymysql) -> bool:
+        operational_error = getattr(
+            getattr(pymysql, "err", None),
+            "OperationalError",
+            None,
+        )
+        if operational_error is None or not isinstance(exc, operational_error):
+            return False
+        args = getattr(exc, "args", ())
+        if not args:
+            return False
+        try:
+            return int(args[0]) == 1049
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _cancelled_result(
+        exc: DatabaseCreationDeclinedError,
+    ) -> DatabaseActionResult:
+        return DatabaseActionResult(
+            False,
+            str(exc),
+            cancelled=True,
+            reason="database_creation_declined",
+            database=exc.database_name,
+        )
+
+    @staticmethod
+    def _load_pymysql():
         try:
             import pymysql
         except ImportError as exc:
             raise RuntimeError(
                 "尚未安裝pymysql，請執行pip install -r requirements.txt"
             ) from exc
+        return pymysql
 
+    def _create_database_on_server(
+        self,
+        pymysql,
+        config: dict[str, Any],
+    ) -> None:
+        database = self._database_name(config)
+        charset = self._charset(config)
+        statement = (
+            f"CREATE DATABASE IF NOT EXISTS {self._quote_identifier(database)} "
+            f"DEFAULT CHARACTER SET {charset}"
+        )
+        connection = pymysql.connect(
+            **self._connection_kwargs(
+                config,
+                select_database=False,
+                autocommit=True,
+            )
+        )
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(statement)
+        finally:
+            connection.close()
+
+    def _ensure_tables_on_connection(self, connection) -> None:
+        sql_path = Path(__file__).resolve().parents[1] / "sql" / "create_tables.sql"
+        sql_text = sql_path.read_text(encoding="utf-8")
+        statements = [item.strip() for item in sql_text.split(";") if item.strip()]
+        with connection.cursor() as cursor:
+            for statement in statements:
+                cursor.execute(statement)
+
+    def _connect_after_missing_database(
+        self,
+        pymysql,
+        config: dict[str, Any],
+    ):
+        database = self._database_name(config)
+        with self._database_creation_lock:
+            try:
+                return pymysql.connect(
+                    **self._connection_kwargs(
+                        config,
+                        select_database=True,
+                    )
+                )
+            except Exception as retry_exc:
+                if not self._is_unknown_database_error(retry_exc, pymysql):
+                    raise
+
+            with self._lock:
+                handler = self._missing_database_handler
+
+            if handler is None:
+                raise RuntimeError("未設定資料庫不存在時的詢問處理函式")
+            try:
+                should_create = bool(handler(database))
+            except Exception as handler_exc:
+                self._log(
+                    f"詢問是否建立資料庫失敗：{handler_exc}",
+                    "ERROR",
+                )
+                raise RuntimeError(
+                    "無法詢問使用者是否建立資料庫"
+                ) from handler_exc
+
+            if not should_create:
+                raise DatabaseCreationDeclinedError(database)
+
+            self._create_database_on_server(pymysql, config)
+            connection = pymysql.connect(
+                **self._connection_kwargs(
+                    config,
+                    select_database=True,
+                )
+            )
+            try:
+                self._ensure_tables_on_connection(connection)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                connection.close()
+                raise
+
+            self._log(f'資料庫"{database}"與必要資料表已建立')
+            return connection
+
+    def _connect(self):
+        pymysql = self._load_pymysql()
         with self._lock:
             config = dict(self._config)
-        database = str(config.get("database", "")).strip()
-        if not database:
-            raise ValueError("database.database不可為空白")
-        return pymysql.connect(
-            host=str(config.get("host", "127.0.0.1")),
-            port=int(config.get("port", 3306)),
-            user=str(config.get("user", "")),
-            password=str(config.get("password", "")),
-            database=database,
-            charset=str(config.get("charset", "utf8mb4")),
-            connect_timeout=max(1, int(float(config.get("connect_timeout", 5)))),
-            read_timeout=max(1, int(float(config.get("read_timeout", config.get("connect_timeout", 5))))),
-            write_timeout=max(1, int(float(config.get("write_timeout", config.get("connect_timeout", 5))))),
-            autocommit=False,
-        )
+        try:
+            return pymysql.connect(
+                **self._connection_kwargs(
+                    config,
+                    select_database=True,
+                )
+            )
+        except Exception as exc:
+            if not self._is_unknown_database_error(exc, pymysql):
+                raise
+            return self._connect_after_missing_database(pymysql, config)
 
     def test_connection(self):
         try:
@@ -125,23 +355,26 @@ class DatabaseManager:
                 with connection.cursor() as cursor:
                     cursor.execute("SELECT 1")
                     cursor.fetchone()
+                self._ensure_tables_on_connection(connection)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
             finally:
                 connection.close()
-            return True, "資料庫連線成功"
+            return True, "資料庫連線成功，必要資料表已確認"
+        except DatabaseCreationDeclinedError as exc:
+            self._log(str(exc), "INFO")
+            return self._cancelled_result(exc)
         except Exception as exc:
             self._log(f"資料庫連線失敗：{exc}", "ERROR")
             return False, f"資料庫連線失敗：{exc}"
 
     def ensure_tables(self):
-        sql_path = Path(__file__).resolve().parents[1] / "sql" / "create_tables.sql"
         try:
-            sql_text = sql_path.read_text(encoding="utf-8")
-            statements = [item.strip() for item in sql_text.split(";") if item.strip()]
             connection = self._connect()
             try:
-                with connection.cursor() as cursor:
-                    for statement in statements:
-                        cursor.execute(statement)
+                self._ensure_tables_on_connection(connection)
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -149,6 +382,9 @@ class DatabaseManager:
             finally:
                 connection.close()
             return True, "資料表確認與建立完成"
+        except DatabaseCreationDeclinedError as exc:
+            self._log(str(exc), "INFO")
+            return self._cancelled_result(exc)
         except Exception as exc:
             self._log(f"資料表建立失敗：{exc}", "ERROR")
             return False, f"資料表建立失敗：{exc}"
@@ -339,6 +575,18 @@ class DatabaseManager:
             if not self._is_enabled(self._config):
                 return False, "config.json尚未啟用database.enable"
 
+        readiness = self.ensure_tables()
+        if isinstance(readiness, dict):
+            if not self._as_bool(readiness.get("success"), False):
+                return readiness
+        elif not readiness[0]:
+            return readiness
+
+        with self._lock:
+            if self._worker and self._worker.is_alive():
+                return False, "資料庫背景寫入執行緒仍在停止中，請稍後再啟動"
+            if self._auto_write_running:
+                return True, "自動上傳已在執行"
             self._stop_event.clear()
             self._auto_write_running = True
             self.value_bus.subscribe(self._enqueue_point)

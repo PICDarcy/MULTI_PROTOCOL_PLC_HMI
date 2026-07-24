@@ -1,78 +1,29 @@
-"""Modbus TCP多設備輪詢、讀取與寫入管理。"""
+"""Modbus TCP多PLC通訊、輪詢與點位讀寫管理器。"""
 
 from __future__ import annotations
 
-import math
-import struct
 import threading
-import time
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, Mapping
-from urllib.parse import quote
+from typing import Any
 
-from .data_model import PointValue
+from .data_model import PointValue, make_modbus_tcp_point_key
+from .modbus_manager import ModbusRtuManager
 
 PROTOCOL_MODBUS_TCP = "MODBUS_TCP"
 
 
-def _key_part(value: Any) -> str:
-    return quote(str(value), safe="")
+class ModbusTcpManager(ModbusRtuManager):
+    """每台PLC使用各自的IP、TCP Port與Unit ID。
 
-
-def make_modbus_tcp_point_key(
-    host: str,
-    port: int,
-    unit_id: int,
-    point_type: str,
-    address: int,
-    point_name: str = "",
-    device_name: str = "",
-) -> str:
-    return "::".join(
-        (
-            PROTOCOL_MODBUS_TCP,
-            _key_part(f"{host}:{int(port)}"),
-            str(int(unit_id)),
-            _key_part(str(point_type).upper()),
-            str(int(address)),
-            _key_part(device_name),
-            _key_part(point_name),
-        )
-    )
-
-
-class ModbusTcpManager:
-    """使用Modbus TCP輪詢多台設備。"""
+    相同IP與Port的裝置會共用一個TCP Client，讓TCP Gateway後方的多個
+    Unit ID仍可使用；不同端點則各自建立及維護Client。
+    """
 
     def __init__(self, config_manager, value_bus, log_func=None):
-        self.config_manager = config_manager
-        self.value_bus = value_bus
-        self.log_func = log_func
-        self._state_lock = threading.RLock()
-        self._io_lock = threading.RLock()
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._clients: dict[str, Any] = {}
-        self._config: dict[str, Any] = {}
-        self._points: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
-        self.reload_config()
-
-    def _log(self, message: str, level: str = "INFO") -> None:
-        if callable(self.log_func):
-            try:
-                self.log_func(message, level)
-            except TypeError:
-                self.log_func(message)
-
-    @staticmethod
-    def _to_bool(value: Any, default: bool = False) -> bool:
-        if value is None:
-            return default
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "y", "on", "是", "啟用"}
-        return bool(value)
+        self._clients: dict[tuple[str, int], Any] = {}
+        self._config_generation = 0
+        super().__init__(config_manager, value_bus, log_func)
 
     def _config_snapshot(self) -> dict[str, Any]:
         getter = getattr(self.config_manager, "get_section", None)
@@ -90,65 +41,75 @@ class ModbusTcpManager:
             return dict(root["modbus_tcp"])
         return {}
 
+    def reload_config(self):
+        old_keys = set(getattr(self, "_points", {}))
+        with self._state_lock:
+            self._config_generation += 1
+
+        # 非輪詢狀態下super().reload_config()不會關閉Client，需主動清理舊端點，
+        # 並以io->state鎖序避免寫入使用舊端點重建Client。
+        if not self.is_running():
+            with self._io_lock:
+                self._close_client()
+                result = super().reload_config()
+        else:
+            result = super().reload_config()
+
+        retired_keys = old_keys.difference(self._points)
+        remove_many = getattr(self.value_bus, "remove_many", None)
+        if retired_keys and callable(remove_many):
+            remove_many(retired_keys)
+        return result
+
     def _device_host(self, device: Mapping[str, Any]) -> str:
-        return str(device.get("host", device.get("ip", "127.0.0.1"))).strip() or "127.0.0.1"
+        # fallback保留舊版「全域host/port」設定的讀取相容性。
+        return str(
+            device.get("host", device.get("ip", self._config.get("host", "127.0.0.1")))
+            or ""
+        ).strip()
 
     def _device_port(self, device: Mapping[str, Any]) -> int:
-        return int(device.get("port", self._config.get("default_port", 502)))
+        return int(device.get("port", self._config.get("port", 502)))
 
-    def _device_unit(self, device: Mapping[str, Any]) -> int:
-        return int(device.get("unit_id", device.get("station_id", device.get("slave", 1))))
+    def _endpoint(self, device: Mapping[str, Any]) -> str:
+        host = self._device_host(device)
+        display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        return f"{display_host}:{self._device_port(device)}"
 
-    def _client_key(self, device: Mapping[str, Any]) -> str:
-        return f"{self._device_host(device)}:{self._device_port(device)}"
+    def _client_key(self, device: Mapping[str, Any]) -> tuple[str, int]:
+        host = self._device_host(device)
+        if not host:
+            raise ValueError(f"PLC「{device.get('name', '')}」未設定主機/IP")
+        port = self._device_port(device)
+        if not 1 <= port <= 65535:
+            raise ValueError(f"PLC「{device.get('name', '')}」TCP Port必須介於1到65535")
+        return host.casefold(), port
 
     def _point_key(self, device: Mapping[str, Any], point: Mapping[str, Any]) -> str:
+        source = f"{self._endpoint(device)}|{device.get('name', '')}"
         return make_modbus_tcp_point_key(
-            self._device_host(device),
-            self._device_port(device),
-            self._device_unit(device),
+            source,
+            int(device.get("station_id", 1)),
             str(point.get("type", "holding_register")),
             int(point.get("address", 0)),
             str(point.get("name", "")),
-            str(device.get("name", "")),
         )
-
-    def reload_config(self):
-        was_running = self.is_running()
-        if was_running:
-            stop_message = self.stop_polling()
-            if self.is_running():
-                raise RuntimeError(f"Modbus TCP輪詢尚未完全停止，暫不重新載入設定：{stop_message}")
-        with self._state_lock:
-            self._config = self._config_snapshot()
-            self._points.clear()
-            for device in self._config.get("devices", []):
-                if not isinstance(device, Mapping):
-                    continue
-                for point in device.get("points", []):
-                    if isinstance(point, Mapping):
-                        key = self._point_key(device, point)
-                        if key in self._points:
-                            raise ValueError(f"Modbus TCP point_key重複：{key}")
-                        self._points[key] = (dict(device), dict(point))
-        if was_running and self._to_bool(self._config.get("enable"), False):
-            self.start_polling()
-        return {"point_count": len(self._points), "running": self.is_running()}
 
     def _make_client(self, device: Mapping[str, Any]):
         try:
             from pymodbus.client import ModbusTcpClient
         except ImportError as exc:
-            raise RuntimeError("尚未安裝pymodbus，請執行pip install -r requirements.txt") from exc
-        host = self._device_host(device)
-        port = self._device_port(device)
-        timeout = float(device.get("timeout", self._config.get("timeout", 1.0)))
-        try:
-            return ModbusTcpClient(host=host, port=port, timeout=timeout)
-        except TypeError:
-            return ModbusTcpClient(host, port=port, timeout=timeout)
+            raise RuntimeError(
+                "尚未安裝pymodbus，請先執行pip install -r requirements.txt"
+            ) from exc
 
-    def _ensure_client(self, device: Mapping[str, Any]):
+        return ModbusTcpClient(
+            host=self._device_host(device),
+            port=self._device_port(device),
+            timeout=float(self._config.get("timeout", 3.0)),
+        )
+
+    def _ensure_client_unlocked(self, device: Mapping[str, Any]):
         key = self._client_key(device)
         client = self._clients.get(key)
         if client is None:
@@ -156,136 +117,75 @@ class ModbusTcpManager:
             self._clients[key] = client
         connected = client.connect()
         if connected is False:
-            raise ConnectionError(f"無法連線Modbus TCP設備：{key}")
+            self._discard_client_unlocked(device)
+            raise ConnectionError(f"無法連線Modbus TCP：{self._endpoint(device)}")
         return client
 
-    def _close_clients(self) -> None:
+    def _discard_client_unlocked(self, device: Mapping[str, Any]) -> None:
+        try:
+            key = self._client_key(device)
+        except (TypeError, ValueError):
+            return
+        client = self._clients.pop(key, None)
+        if client is not None:
+            try:
+                client.close()
+            except Exception as exc:
+                self._log(
+                    f"關閉Modbus TCP Client「{self._endpoint(device)}」失敗：{exc}",
+                    "WARNING",
+                )
+
+    def _discard_client(self, device: Mapping[str, Any]) -> None:
+        with self._io_lock:
+            self._discard_client_unlocked(device)
+
+    def _close_client(self) -> None:
         with self._io_lock:
             clients, self._clients = self._clients, {}
-            for client in clients.values():
+            self._client = None
+            for (host, port), client in clients.items():
                 try:
                     client.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._log(
+                        f"關閉Modbus TCP Client「{host}:{port}」失敗：{exc}",
+                        "WARNING",
+                    )
 
-    @staticmethod
-    def _call_unit(method, unit_id: int, **kwargs):
-        last_error = None
-        for unit_key in ("device_id", "slave", "unit"):
-            try:
-                return method(**kwargs, **{unit_key: unit_id})
-            except TypeError as exc:
-                last_error = exc
-        if last_error is not None:
-            raise last_error
-        return method(**kwargs)
-
-    @staticmethod
-    def _response_error(response) -> None:
-        if response is None:
-            raise RuntimeError("Modbus TCP沒有回應")
-        checker = getattr(response, "isError", None)
-        if callable(checker) and checker():
-            raise RuntimeError(str(response))
-
-    def _read_raw_locked(self, client, device: Mapping[str, Any], point: Mapping[str, Any]):
-        unit_id = self._device_unit(device)
-        address = int(point.get("address", 0))
-        count = max(1, int(point.get("count", 1)))
-        point_type = str(point.get("type", "holding_register")).lower()
-        methods = {
-            "holding_register": "read_holding_registers",
-            "input_register": "read_input_registers",
-            "coil": "read_coils",
-            "discrete_input": "read_discrete_inputs",
-        }
-        method_name = methods.get(point_type)
-        if method_name is None:
-            raise ValueError(f"不支援的Modbus TCP點位類型：{point_type}")
-        method = getattr(client, method_name)
-        response = self._call_unit(method, unit_id, address=address, count=count)
-        self._response_error(response)
-        if point_type in {"coil", "discrete_input"}:
-            return list(getattr(response, "bits", []))[:count]
-        return list(getattr(response, "registers", []))[:count]
-
-    @staticmethod
-    def _ordered_bytes(registers: list[int], data_type: str) -> bytes:
-        raw = b"".join(struct.pack(">H", int(value) & 0xFFFF) for value in registers)
-        normalized = data_type.upper().replace("-", "_")
-        suffix = normalized.rsplit("_", 1)[-1]
-        if suffix not in {"ABCD", "BADC", "CDAB", "DCBA"}:
-            suffix = "ABCD"
-        if suffix in {"BADC", "DCBA"}:
-            raw = b"".join(raw[index : index + 2][::-1] for index in range(0, len(raw), 2))
-        if suffix in {"CDAB", "DCBA"} and len(raw) >= 4:
-            words = [raw[index : index + 2] for index in range(0, len(raw), 2)]
-            raw = b"".join(reversed(words))
-        return raw
-
-    @classmethod
-    def _decode(cls, raw_values: list[Any], data_type: str, point_type: str):
-        normalized = str(data_type or "Auto").upper().replace("-", "_")
-        point_type = str(point_type or "").lower()
-        if point_type in {"coil", "discrete_input"}:
-            values = [bool(value) for value in raw_values]
-            return values[0] if len(values) == 1 else values
-        registers = [int(value) & 0xFFFF for value in raw_values]
-        raw = cls._ordered_bytes(registers, normalized)
-        base = normalized.split("_", 1)[0]
-        if base in {"AUTO", "UINT16"}:
-            return registers[0] if len(registers) == 1 else registers
-        if base in {"BOOL", "BOOLEAN"}:
-            return bool(registers[0])
-        if base == "INT16":
-            return struct.unpack(">h", raw[:2])[0]
-        formats = {"UINT32": ">I", "INT32": ">i", "FLOAT32": ">f", "FLOAT": ">f", "UINT64": ">Q", "INT64": ">q", "FLOAT64": ">d", "DOUBLE": ">d"}
-        if base in formats:
-            size = struct.calcsize(formats[base])
-            if len(raw) < size:
-                raise ValueError(f"{data_type}需要{size // 2}個Register")
-            return struct.unpack(formats[base], raw[:size])[0]
-        if base == "STRING":
-            return raw.rstrip(b"\x00").decode("utf-8", errors="replace")
-        if base == "RAW":
-            return registers
-        raise ValueError(f"不支援的Modbus TCP data_type：{data_type}")
-
-    @staticmethod
-    def _value_text(value: Any) -> str:
-        if isinstance(value, list):
-            return ", ".join(str(item) for item in value)
-        return str(value)
-
-    @staticmethod
-    def _value_number(value: Any):
-        if isinstance(value, bool):
-            return 1.0 if value else 0.0
-        if isinstance(value, (int, float)):
-            number = float(value)
-            return number if math.isfinite(number) else None
-        return None
-
-    def _publish(self, device: Mapping[str, Any], point: Mapping[str, Any], value: Any, status: str):
-        key = self._point_key(device, point)
-        host = self._device_host(device)
-        port = self._device_port(device)
-        unit_id = self._device_unit(device)
+    def _publish(
+        self,
+        device: Mapping[str, Any],
+        point: Mapping[str, Any],
+        value: Any,
+        status: str,
+    ):
+        endpoint = self._endpoint(device)
         raw_config = dict(point)
-        raw_config.update({"host": host, "port": port, "unit_id": unit_id, "device_name": str(device.get("name", ""))})
+        raw_config.update(
+            {
+                "station_id": int(device.get("station_id", 1)),
+                "host": self._device_host(device),
+                "port": self._device_port(device),
+                "device_name": str(device.get("name", "")),
+            }
+        )
         point_value = PointValue(
-            point_key=key,
+            point_key=self._point_key(device, point),
             protocol=PROTOCOL_MODBUS_TCP,
-            source_name=f"{host}:{port}",
+            source_name=endpoint,
             device_name=str(device.get("name", "")),
             point_name=str(point.get("name", "")),
-            address_text=f"{host}:{port} Unit {unit_id} {point.get('type', '')} {point.get('address', 0)}",
+            address_text=(
+                f"{endpoint} Unit ID {device.get('station_id', 1)} "
+                f"{point.get('type', '')} {point.get('address', 0)}"
+            ),
             value=value,
             value_text=self._value_text(value),
             value_number=self._value_number(value),
             status_text=status,
             timestamp=datetime.now(),
-            writable=self._to_bool(point.get("writable"), False),
+            writable=self._as_bool(point.get("writable", False), False),
             data_type=str(point.get("data_type", "Auto")),
             raw_config=raw_config,
         )
@@ -297,161 +197,149 @@ class ModbusTcpManager:
         failed = 0
         with self._state_lock:
             devices = list(self._config.get("devices", []))
+            generation = self._config_generation
+
         for device in devices:
             if self._stop_event.is_set():
                 break
-            if not isinstance(device, Mapping) or not self._to_bool(device.get("enable"), True):
+            if not isinstance(device, Mapping) or not self._as_bool(
+                device.get("enable", True), True
+            ):
                 continue
-            for point in device.get("points", []):
+
+            points = [
+                point
+                for point in device.get("points", [])
+                if isinstance(point, Mapping)
+                and self._as_bool(point.get("enable", True), True)
+            ]
+            if not points:
+                continue
+
+            try:
+                with self._io_lock:
+                    with self._state_lock:
+                        if generation != self._config_generation:
+                            break
+                    client = self._ensure_client_unlocked(device)
+            except Exception as exc:
+                self._discard_client(device)
+                for point in points:
+                    self._publish(device, point, None, f"連線失敗：{exc}")
+                self._log(
+                    f"Modbus TCP PLC「{device.get('name', '')}」"
+                    f"（{self._endpoint(device)}）連線失敗：{exc}",
+                    "ERROR",
+                )
+                failed += len(points)
+                continue
+
+            for point in points:
                 if self._stop_event.is_set():
                     break
-                if not isinstance(point, Mapping) or not self._to_bool(point.get("enable"), True):
-                    continue
                 try:
                     with self._io_lock:
-                        client = self._ensure_client(device)
-                        raw = self._read_raw_locked(client, device, point)
-                    value = self._decode(raw, str(point.get("data_type", "Auto")), str(point.get("type", "")))
+                        with self._state_lock:
+                            if generation != self._config_generation:
+                                return {
+                                    "success": success,
+                                    "failed": failed,
+                                    "total": success + failed,
+                                }
+                        client = self._ensure_client_unlocked(device)
+                        raw = self._read_raw_unlocked(client, device, point)
+                    value = self._decode(
+                        raw,
+                        str(point.get("data_type", "Auto")),
+                        str(point.get("type", "")),
+                    )
                     self._publish(device, point, value, "Good")
                     success += 1
                 except Exception as exc:
                     self._publish(device, point, None, f"讀取失敗：{exc}")
-                    self._log(f"Modbus TCP點位「{point.get('name', '')}」讀取失敗：{exc}", "ERROR")
+                    self._log(
+                        f"Modbus TCP「{self._endpoint(device)}」點位"
+                        f"「{point.get('name', '')}」讀取失敗：{exc}",
+                        "ERROR",
+                    )
                     failed += 1
         return {"success": success, "failed": failed, "total": success + failed}
 
-    def _poll_loop(self) -> None:
+    def write_point(self, point_key, value_text):
         try:
-            interval = max(0.05, float(self._config.get("poll_interval", 1.0)))
-            while not self._stop_event.is_set():
-                started = time.monotonic()
-                try:
-                    self.read_all_once()
-                except Exception as exc:
-                    self._log(f"Modbus TCP輪詢失敗：{exc}", "ERROR")
-                    self._close_clients()
-                self._stop_event.wait(max(0.0, interval - (time.monotonic() - started)))
-        finally:
-            self._close_clients()
-            with self._state_lock:
-                current = threading.current_thread()
-                if self._thread is current:
-                    self._thread = None
+            with self._io_lock:
+                with self._state_lock:
+                    item = self._points.get(str(point_key))
+                if item is None:
+                    raise KeyError(f"找不到Modbus TCP點位：{point_key}")
+
+                device, point = item
+                if not self._as_bool(point.get("writable", False), False):
+                    raise PermissionError(
+                        f"Modbus TCP點位不可寫入："
+                        f"{point.get('name', point_key)}"
+                    )
+
+                point_type = str(
+                    point.get("type", "holding_register")
+                ).lower()
+                if point_type not in {"holding_register", "coil"}:
+                    raise ValueError(
+                        f"{point_type}不支援寫入，"
+                        "僅holding_register與coil可寫入"
+                    )
+
+                station = int(device.get("station_id", 1))
+                address = int(point.get("address", 0))
+                count = max(1, int(point.get("count", 1)))
+                client = self._ensure_client_unlocked(device)
+                if point_type == "coil":
+                    response = self._write_coil_unlocked(
+                        client,
+                        station,
+                        address,
+                        self._parse_bool(value_text),
+                    )
+                else:
+                    registers = self._encode_registers(
+                        value_text,
+                        str(point.get("data_type", "UInt16")),
+                        count,
+                    )
+                    response = self._write_registers_unlocked(
+                        client, station, address, registers
+                    )
+                self._response_error(response)
+                raw = self._read_raw_unlocked(client, device, point)
+        except Exception:
+            if "device" in locals():
+                self._discard_client(device)
+            raise
+
+        value = self._decode(
+            raw,
+            str(point.get("data_type", "Auto")),
+            point_type,
+        )
+        self._publish(device, point, value, "WriteGood")
+        return True
 
     def start_polling(self):
         with self._state_lock:
             if self._thread and self._thread.is_alive():
+                if self._stop_event.is_set():
+                    return "Modbus TCP輪詢正在停止，請稍後再啟動"
                 return "Modbus TCP輪詢已在執行"
-            if not self._to_bool(self._config.get("enable"), False):
+            self._thread = None
+            if not self._as_bool(
+                self._config.get("enable", self._config.get("enabled")), False
+            ):
                 raise RuntimeError("config.json尚未啟用modbus_tcp.enable")
             self._stop_event.clear()
-            self._thread = threading.Thread(target=self._poll_loop, name="ModbusTcpPolling", daemon=True)
+            self._thread = threading.Thread(
+                target=self._poll_loop,
+                name="ModbusTcpPolling",
+                daemon=True,
+            )
             self._thread.start()
         return "Modbus TCP輪詢已啟動"
-
-    def stop_polling(self):
-        self._stop_event.set()
-        with self._state_lock:
-            thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=max(2.0, float(self._config.get("timeout", 1.0)) + 1.0))
-        if thread is not None and thread.is_alive():
-            self._log("Modbus TCP輪詢執行緒停止逾時，等待目前通訊逾時後自動結束", "WARNING")
-            return "Modbus TCP輪詢停止逾時，正在等待目前通訊結束"
-        self._close_clients()
-        with self._state_lock:
-            if self._thread is thread:
-                self._thread = None
-        return "Modbus TCP輪詢已停止"
-
-    def is_running(self) -> bool:
-        with self._state_lock:
-            return bool(self._thread and self._thread.is_alive())
-
-    @classmethod
-    def _encode_registers(cls, value_text: Any, data_type: str, count: int) -> list[int]:
-        normalized = str(data_type or "UInt16").upper().replace("-", "_")
-        base = normalized.split("_", 1)[0]
-        if base in {"AUTO", "UINT16"}:
-            registers = [int(str(value_text).strip(), 0)]
-        elif base == "INT16":
-            registers = list(struct.unpack(">H", struct.pack(">h", int(value_text))))
-        else:
-            formats = {"UINT32": ">I", "INT32": ">i", "FLOAT32": ">f", "FLOAT": ">f", "UINT64": ">Q", "INT64": ">q", "FLOAT64": ">d", "DOUBLE": ">d"}
-            if base == "STRING":
-                raw = str(value_text).encode("utf-8")[: count * 2].ljust(count * 2, b"\x00")
-            elif base in formats:
-                converter = float if base in {"FLOAT32", "FLOAT64", "FLOAT", "DOUBLE"} else int
-                raw = struct.pack(formats[base], converter(value_text))
-            else:
-                raise ValueError(f"不支援的Modbus TCP寫入data_type：{data_type}")
-            suffix = normalized.rsplit("_", 1)[-1]
-            if suffix in {"CDAB", "DCBA"} and len(raw) >= 4:
-                words = [raw[index : index + 2] for index in range(0, len(raw), 2)]
-                raw = b"".join(reversed(words))
-            if suffix in {"BADC", "DCBA"}:
-                raw = b"".join(raw[index : index + 2][::-1] for index in range(0, len(raw), 2))
-            registers = [struct.unpack(">H", raw[index : index + 2])[0] for index in range(0, len(raw), 2)]
-        if len(registers) > count:
-            raise ValueError(f"寫入值需要{len(registers)}個Register，但設定count只有{count}")
-        return registers + [0] * (count - len(registers))
-
-    @staticmethod
-    def _encode_bits(value_text: Any, count: int) -> list[bool]:
-        text = str(value_text).strip()
-        lowered = text.lower()
-        if count <= 1:
-            if lowered in {"1", "true", "yes", "y", "on", "是"}:
-                return [True]
-            if lowered in {"0", "false", "no", "n", "off", "否"}:
-                return [False]
-            return [bool(int(text, 0))]
-        separators = "," if "," in text else " "
-        items = [item.strip() for item in text.split(separators) if item.strip()]
-        if len(items) != count:
-            raise ValueError(f"需要{count}個Boolean值")
-        return [ModbusTcpManager._encode_bits(item, 1)[0] for item in items]
-
-    def _write_raw_locked(self, client, device: Mapping[str, Any], point: Mapping[str, Any], value_text: Any):
-        unit_id = self._device_unit(device)
-        address = int(point.get("address", 0))
-        count = max(1, int(point.get("count", 1)))
-        point_type = str(point.get("type", "holding_register")).lower()
-        data_type = str(point.get("data_type", "Auto"))
-        if point_type == "holding_register":
-            registers = self._encode_registers(value_text, data_type, count)
-            if len(registers) == 1:
-                response = self._call_unit(client.write_register, unit_id, address=address, value=registers[0])
-            else:
-                method = getattr(client, "write_registers")
-                try:
-                    response = self._call_unit(method, unit_id, address=address, values=registers)
-                except TypeError:
-                    response = self._call_unit(method, unit_id, address=address, registers=registers)
-            self._response_error(response)
-            return registers
-        if point_type == "coil":
-            bits = self._encode_bits(value_text, count)
-            if len(bits) == 1:
-                response = self._call_unit(client.write_coil, unit_id, address=address, value=bits[0])
-            else:
-                response = self._call_unit(client.write_coils, unit_id, address=address, values=bits)
-            self._response_error(response)
-            return bits
-        raise ValueError("Modbus TCP只支援寫入holding_register與coil")
-
-    def write_point(self, point_key: str, value_text: Any):
-        with self._state_lock:
-            item = self._points.get(str(point_key))
-        if item is None:
-            raise KeyError(f"找不到Modbus TCP點位：{point_key}")
-        device, point = item
-        if not self._to_bool(point.get("writable"), False):
-            raise PermissionError(f"點位不可寫入：{point.get('name', '')}")
-        with self._io_lock:
-            client = self._ensure_client(device)
-            self._write_raw_locked(client, device, point, value_text)
-            raw = self._read_raw_locked(client, device, point)
-        value = self._decode(raw, str(point.get("data_type", "Auto")), str(point.get("type", "")))
-        self._publish(device, point, value, "Good")
-        return True

@@ -11,7 +11,7 @@ from typing import Any, Mapping
 from urllib.parse import quote, unquote
 
 
-SUPPORTED_PROTOCOLS = frozenset({"MODBUS_RTU", "OPCUA"})
+SUPPORTED_PROTOCOLS = frozenset({"MODBUS_RTU", "MODBUS_TCP", "OPCUA"})
 
 
 _DATA_TYPE_ALIASES = {
@@ -294,6 +294,26 @@ def make_modbus_point_key(
     )
 
 
+def make_modbus_tcp_point_key(
+    endpoint: str,
+    station_id: int,
+    point_type: str,
+    address: int,
+    point_name: str = "",
+) -> str:
+    """建立Modbus TCP點位唯一鍵。"""
+    return "::".join(
+        (
+            "MODBUS_TCP",
+            _key_part(endpoint),
+            str(int(station_id)),
+            _key_part(str(point_type).upper()),
+            str(int(address)),
+            _key_part(point_name),
+        )
+    )
+
+
 def make_opcua_point_key(server_name: str, node_id: str) -> str:
     """建立包含Server名稱及NodeId的OPC UA點位唯一鍵。"""
     return f"OPCUA::{_key_part(server_name)}::{_key_part(node_id)}"
@@ -348,7 +368,8 @@ class PointValue:
         self.protocol = str(self.protocol).strip().upper()
         if self.protocol not in SUPPORTED_PROTOCOLS:
             raise ValueError(
-                f"不支援的protocol：{self.protocol}，只允許MODBUS_RTU或OPCUA"
+                f"不支援的protocol：{self.protocol}，"
+                "只允許MODBUS_RTU、MODBUS_TCP或OPCUA"
             )
 
         self.source_name = str(self.source_name or "")

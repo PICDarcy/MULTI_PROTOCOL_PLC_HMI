@@ -1,6 +1,6 @@
 # MULTI_PROTOCOL_PLC_HMI執行說明
 
-本專案使用Python Tkinter開發工業通訊整合HMI，整合Modbus RTU、OPC UA與MySQL/MariaDB資料庫。專案以`config.json`集中管理通訊設備、點位與資料庫設定。
+本專案使用Python Tkinter開發工業通訊整合HMI，整合Modbus RTU、Modbus TCP、OPC UA與MySQL/MariaDB資料庫。專案以`config.json`集中管理通訊設備、點位與資料庫設定。
 
 ## 1. 系統需求
 
@@ -55,7 +55,7 @@ python -m pip install -r requirements.txt
 
 主要套件用途：
 
-- `pymodbus`：Modbus RTU讀寫。
+- `pymodbus`：Modbus RTU與Modbus TCP讀寫。
 - `pyserial`：序列埠通訊支援。
 - `asyncua`：OPC UA Client、訂閱與節點瀏覽。
 - `pymysql`：MySQL/MariaDB資料庫連線。
@@ -66,6 +66,7 @@ python -m pip install -r requirements.txt
 
 - `database`：資料庫連線與自動寫入設定。
 - `modbus_rtu`：序列埠參數、PLC站號與Modbus點位。
+- `modbus_tcp`：每台PLC各自的主機/IP、TCP連接埠、Unit ID與Modbus點位。
 - `opcua`：OPC UA Server連線參數與Node設定。
 
 所有功能區塊預設可使用`enable`控制是否啟用。個別設備、Server與點位也各自提供`enable`欄位。
@@ -82,6 +83,14 @@ python -m pip install -r requirements.txt
 - `baudrate`：常見值為9600、19200、38400、115200。
 - `parity`：可使用`N`、`E`、`O`。
 - `station_id`：Modbus從站站號，通常為1至247。
+
+## 6.1 Modbus TCP設定重點
+
+- `devices[].host`：該台PLC或Modbus TCP Gateway的IP位址/主機名稱。
+- `devices[].port`：該台PLC的TCP連接埠，標準值為502。
+- `timeout`：連線及請求逾時秒數。
+- `poll_interval`：所有啟用點位的輪詢間隔秒數。
+- `devices[].station_id`：該台PLC的Unit ID；不同IP可使用相同Unit ID。
 - `type`支援：
   - `holding_register`
   - `input_register`
@@ -101,7 +110,19 @@ python -m pip install -r requirements.txt
 
 ## 8. 建立資料庫與資料表
 
-先建立與`config.json`內`database.database`相同名稱的資料庫。範例使用`plc_hmi`：
+儲存資料庫設定後，執行「測試連線」或「啟動自動上傳」即可。若指定的
+資料庫不存在，程式會詢問：
+
+```text
+偵測不到資料庫是否建立資料庫"plc_hmi"
+```
+
+選擇「是」會建立資料庫，並自動確認或建立`plc_point_history`及
+`plc_point_latest`兩張必要資料表；選擇「否」則不會建立或變更資料庫。
+指定資料庫已存在時，程式也會自動確認必要資料表，因此不必另外按
+「自動建立資料表」。資料庫帳號必須具有建立資料庫與資料表的權限。
+
+若要改用資料庫工具手動建立，範例為：
 
 ```sql
 CREATE DATABASE IF NOT EXISTS plc_hmi

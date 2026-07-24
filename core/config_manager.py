@@ -34,6 +34,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "poll_interval": 1.0,
         "devices": [],
     },
+    "modbus_tcp": {
+        "enable": False,
+        "timeout": 3.0,
+        "poll_interval": 1.0,
+        "devices": [],
+    },
     "opcua": {
         "enable": False,
         "servers": [],

@@ -579,6 +579,7 @@ class DatabasePage(ttk.Frame):
         result: Any,
         error: Optional[BaseException],
     ) -> None:
+        cancelled = error is None and self._is_cancelled_result(result)
         success, message = self._normalise_result(
             result,
             error,
@@ -586,11 +587,15 @@ class DatabasePage(ttk.Frame):
             "資料庫連線失敗",
         )
         self.connection_status_var.set(
-            "連線成功" if success else "連線失敗"
+            "連線成功"
+            if success
+            else ("未建立資料庫" if cancelled else "連線失敗")
         )
         self.operation_status_var.set(message)
         self._log(message)
 
+        if cancelled:
+            return
         dialog = messagebox.showinfo if success else messagebox.showerror
         dialog("測試連線", message, parent=self)
 
@@ -599,6 +604,7 @@ class DatabasePage(ttk.Frame):
         result: Any,
         error: Optional[BaseException],
     ) -> None:
+        cancelled = error is None and self._is_cancelled_result(result)
         success, message = self._normalise_result(
             result,
             error,
@@ -608,6 +614,8 @@ class DatabasePage(ttk.Frame):
         self.operation_status_var.set(message)
         self._log(message)
 
+        if cancelled:
+            return
         dialog = messagebox.showinfo if success else messagebox.showerror
         dialog("資料表作業", message, parent=self)
 
@@ -616,6 +624,7 @@ class DatabasePage(ttk.Frame):
         result: Any,
         error: Optional[BaseException],
     ) -> None:
+        cancelled = error is None and self._is_cancelled_result(result)
         success, message = self._normalise_result(
             result,
             error,
@@ -624,12 +633,14 @@ class DatabasePage(ttk.Frame):
         )
         self._local_auto_write_running = success
         self.auto_write_status_var.set(
-            "執行中" if success else "啟動失敗"
+            "執行中"
+            if success
+            else ("已停止" if cancelled else "啟動失敗")
         )
         self.operation_status_var.set(message)
         self._log(message)
 
-        if not success:
+        if not success and not cancelled:
             messagebox.showerror("自動上傳", message, parent=self)
 
     def _on_stop_auto_write_finished(
@@ -712,6 +723,16 @@ class DatabasePage(ttk.Frame):
         return (
             success,
             success_message if success else failure_message,
+        )
+
+    @staticmethod
+    def _is_cancelled_result(result: Any) -> bool:
+        if getattr(result, "cancelled", False):
+            return bool(result and result[0] is False)
+        return bool(
+            isinstance(result, dict)
+            and result.get("cancelled")
+            and result.get("success") is False
         )
 
     def _schedule_status_refresh(self) -> None:

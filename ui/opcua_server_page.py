@@ -166,6 +166,7 @@ class OpcuaServerPage(ttk.Frame):
         self._servers: list[dict[str, Any]] = []
         self._server_status: dict[str, str] = {}
         self._node_status: dict[tuple[str, str], str] = {}
+        self.enable_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="就緒")
 
         self._build_ui()
@@ -201,6 +202,11 @@ class OpcuaServerPage(ttk.Frame):
         parent.rowconfigure(1, weight=1)
         buttons = ttk.Frame(parent)
         buttons.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Checkbutton(
+            buttons,
+            text="啟用OPC UA",
+            variable=self.enable_var,
+        ).pack(side="left", padx=(0, 12), pady=2)
         for text, command in (
             ("新增Server", self._add_server), ("修改Server", self._edit_server),
             ("刪除Server", self._delete_server), ("連線選取Server", self._connect_selected),
@@ -267,6 +273,7 @@ class OpcuaServerPage(ttk.Frame):
         try:
             self._config = self._load_config()
             raw = self._extract_servers(self._config)
+            self.enable_var.set(self._read_global_enabled(self._config))
             self._servers = [self._normalize_server(item) for item in raw]
             self._refresh_servers()
             self.status_var.set(f"已載入{len(self._servers)}組OPC UA Server設定")
@@ -311,6 +318,24 @@ class OpcuaServerPage(ttk.Frame):
                 return [x for x in opcua["servers"] if isinstance(x, dict)]
         self._config_style = "opcua.servers"
         return []
+
+    def _read_global_enabled(self, config: dict[str, Any]) -> bool:
+        if self._config_style == "protocols.opcua.servers":
+            protocols = config.get("protocols", {})
+            opcua = protocols.get("opcua", {}) if isinstance(protocols, dict) else {}
+            return (
+                _bool(opcua.get("enable", opcua.get("enabled", True)), True)
+                if isinstance(opcua, dict)
+                else True
+            )
+        if self._config_style == "opcua_servers":
+            return True
+        opcua = config.get("opcua", {})
+        return (
+            _bool(opcua.get("enable", opcua.get("enabled", False)), False)
+            if isinstance(opcua, dict)
+            else False
+        )
 
     def _normalize_server(self, source: dict[str, Any]) -> dict[str, Any]:
         server = copy.deepcopy(SERVER_DEFAULTS)
@@ -566,6 +591,7 @@ class OpcuaServerPage(ttk.Frame):
         try:
             config = copy.deepcopy(self._config)
             self._put_servers(config, copy.deepcopy(self._servers))
+            self._put_enabled(config, bool(self.enable_var.get()))
             self._write_config(config)
             self._config = config
             reload_method = getattr(self.opcua_manager, "reload_config", None)
@@ -602,6 +628,27 @@ class OpcuaServerPage(ttk.Frame):
             if not isinstance(opcua, dict):
                 opcua = config["opcua"] = {}
             opcua["servers"] = servers
+
+    def _put_enabled(self, config: dict[str, Any], enabled: bool) -> None:
+        """儲存頁面上的OPC UA全域啟用狀態。"""
+        if self._config_style == "protocols.opcua.servers":
+            protocols = config.setdefault("protocols", {})
+            if not isinstance(protocols, dict):
+                protocols = config["protocols"] = {}
+            opcua = protocols.setdefault("opcua", {})
+            if not isinstance(opcua, dict):
+                opcua = protocols["opcua"] = {}
+            opcua["enable"] = enabled
+            return
+
+        if self._config_style == "opcua_servers":
+            # 舊格式沒有全域開關；清單存在時Manager會視為啟用。
+            return
+
+        opcua = config.setdefault("opcua", {})
+        if not isinstance(opcua, dict):
+            opcua = config["opcua"] = {}
+        opcua["enable"] = enabled
 
     def _write_config(self, config: dict[str, Any]) -> None:
         manager = self.config_manager

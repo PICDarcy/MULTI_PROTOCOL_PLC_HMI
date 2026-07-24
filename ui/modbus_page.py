@@ -166,28 +166,34 @@ class ModbusPage(ttk.Frame):
             frame.columnconfigure(0, weight=1)
             frame.rowconfigure(0, weight=1)
 
+        device_specs = self._device_tree_specs()
         self.device_tree = ttk.Treeview(
             devices,
-            columns=("enable", "name", "station_id"),
+            columns=tuple(spec[0] for spec in device_specs),
             show="headings",
             selectmode="browse",
         )
-        for column, text, width in (
-            ("enable", "啟用", 55),
-            ("name", "PLC名稱", 180),
-            ("station_id", "站號", 65),
-        ):
+        for column, text, width, anchor in device_specs:
             self.device_tree.heading(column, text=text)
-            self.device_tree.column(column, width=width, anchor=tk.CENTER if column != "name" else tk.W)
+            self.device_tree.column(column, width=width, anchor=anchor)
         self.device_tree.grid(row=0, column=0, sticky="nsew")
         dscroll = ttk.Scrollbar(devices, command=self.device_tree.yview)
         dscroll.grid(row=0, column=1, sticky="ns")
-        self.device_tree.configure(yscrollcommand=dscroll.set)
+        dxscroll = ttk.Scrollbar(
+            devices,
+            orient=tk.HORIZONTAL,
+            command=self.device_tree.xview,
+        )
+        dxscroll.grid(row=1, column=0, sticky="ew")
+        self.device_tree.configure(
+            yscrollcommand=dscroll.set,
+            xscrollcommand=dxscroll.set,
+        )
         self.device_tree.bind("<<TreeviewSelect>>", self._device_selected)
         self.device_tree.bind("<Double-1>", lambda _event: self.edit_device())
 
         dbuttons = ttk.Frame(devices)
-        dbuttons.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        dbuttons.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Button(dbuttons, text="新增PLC", command=self.add_device).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(dbuttons, text="修改PLC", command=self.edit_device).pack(side=tk.LEFT, padx=5)
         ttk.Button(dbuttons, text="刪除PLC", command=self.delete_device).pack(side=tk.LEFT, padx=5)
@@ -249,6 +255,20 @@ class ModbusPage(ttk.Frame):
         ttk.Button(pbuttons, text="修改點位", command=self.edit_point).pack(side=tk.LEFT, padx=5)
         ttk.Button(pbuttons, text="刪除點位", command=self.delete_point).pack(side=tk.LEFT, padx=5)
 
+    def _device_tree_specs(self):
+        return (
+            ("enable", "啟用", 55, tk.CENTER),
+            ("name", "PLC名稱", 180, tk.W),
+            ("station_id", "站號", 65, tk.CENTER),
+        )
+
+    def _device_tree_values(self, device: Dict[str, Any]):
+        return (
+            self._yes_no(device["enable"]),
+            device["name"],
+            device["station_id"],
+        )
+
     def _build_action_bar(self) -> None:
         frame = ttk.Frame(self, padding=(10, 0, 10, 10))
         frame.grid(row=3, column=0, sticky="ew")
@@ -268,12 +288,10 @@ class ModbusPage(ttk.Frame):
 
     # 裝置與點位管理 -----------------------------------------------------
     def add_device(self) -> None:
-        used_ids = {self._to_int(item.get("station_id"), -1) for item in self.config["devices"]}
-        station_id = next((number for number in range(1, 248) if number not in used_ids), 1)
         initial = copy.deepcopy(DEFAULT_DEVICE)
         initial["name"] = self._unique_name("PLC", self.config["devices"])
-        initial["station_id"] = station_id
-        result = _DeviceDialog(self, "新增PLC", initial).show()
+        initial["station_id"] = self._next_device_station_id()
+        result = self._show_device_dialog("新增PLC", initial)
         if result is None or not self._device_is_unique(result):
             return
         self.config["devices"].append(result)
@@ -286,7 +304,7 @@ class ModbusPage(ttk.Frame):
         if index is None:
             messagebox.showinfo("修改PLC", "請先選取要修改的PLC。", parent=self)
             return
-        result = _DeviceDialog(self, "修改PLC", self.config["devices"][index]).show()
+        result = self._show_device_dialog("修改PLC", self.config["devices"][index])
         if result is None or not self._device_is_unique(result, index):
             return
         self.config["devices"][index] = result
@@ -310,6 +328,23 @@ class ModbusPage(ttk.Frame):
         self.selected_device = min(index, len(self.config["devices"]) - 1) if self.config["devices"] else None
         self._refresh_devices()
         self._status(f"已刪除PLC：{name}，尚未儲存")
+
+    def _next_device_station_id(self) -> int:
+        used_ids = {
+            self._to_int(item.get("station_id"), -1)
+            for item in self.config["devices"]
+        }
+        return next(
+            (number for number in range(1, 248) if number not in used_ids),
+            1,
+        )
+
+    def _show_device_dialog(
+        self,
+        title: str,
+        source: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        return _DeviceDialog(self, title, source).show()
 
     def add_point(self) -> None:
         device_index = self._selected_device_index()
@@ -636,7 +671,7 @@ class ModbusPage(ttk.Frame):
                 "",
                 tk.END,
                 iid=f"device:{index}",
-                values=(self._yes_no(device["enable"]), device["name"], device["station_id"]),
+                values=self._device_tree_values(device),
             )
         if self.config["devices"]:
             if self.selected_device is None or self.selected_device >= len(self.config["devices"]):
