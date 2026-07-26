@@ -61,26 +61,9 @@
 
 ## 3.系統架構
 
-```mermaid
-flowchart LR
-    RTU[Modbus RTU設備] --> RTUM[ModbusRtuManager]
-    TCP[Modbus TCP設備] --> TCPM[ModbusTcpManager]
-    OPC[OPC UA Server] --> OPCM[OpcuaMultiServerManager]
-
-    RTUM --> PV[統一PointValue資料模型]
-    TCPM --> PV
-    OPCM --> PV
-
-    PV --> BUS[ValueBus]
-    BUS --> UI[Tkinter HMI]
-    BUS --> DBM[DatabaseManager]
-    DBM --> DB[(MySQL / MariaDB)]
-
-    CFG[config.json] --> RTUM
-    CFG --> TCPM
-    CFG --> OPCM
-    CFG --> DBM
-```
+<p align="center">
+  <img src="docs/images/system_architecture.svg" alt="MULTI_PROTOCOL_PLC_HMI系統架構圖" width="100%">
+</p>
 
 ### 架構核心
 
@@ -149,6 +132,10 @@ MULTI_PROTOCOL_PLC_HMI/
 ├─ requirements.txt
 ├─ README.md
 ├─ README_RUN.md
+├─ docs/
+│  └─ images/
+│     ├─ system_architecture.svg
+│     └─ pointvalue_model.svg
 ├─ core/
 │  ├─ __init__.py
 │  ├─ config_manager.py
@@ -218,6 +205,10 @@ MULTI_PROTOCOL_PLC_HMI/
 
 所有協定讀到的資料都會轉換成`PointValue`，讓UI與DatabaseManager使用相同欄位處理資料。
 
+<p align="center">
+  <img src="docs/images/pointvalue_model.svg" alt="PointValue統一資料模型圖" width="100%">
+</p>
+
 | 欄位 | 說明 |
 |---|---|
 | `point_key` | 點位唯一識別鍵。 |
@@ -234,23 +225,6 @@ MULTI_PROTOCOL_PLC_HMI/
 | `writable` | 是否允許由HMI寫入。 |
 | `data_type` | 資料型別，例如Bool、UInt16、Float或String。 |
 | `raw_config` | 該點位的原始設定內容。 |
-
-### PointValue資料流
-
-```mermaid
-sequenceDiagram
-    participant PLC
-    participant Manager
-    participant ValueBus
-    participant HMI
-    participant Database
-
-    PLC->>Manager: 回傳點位資料
-    Manager->>Manager: 轉換成PointValue
-    Manager->>ValueBus: publish(PointValue)
-    ValueBus-->>HMI: 更新統一監控畫面
-    ValueBus-->>Database: 寫入啟用的點位
-```
 
 ---
 
