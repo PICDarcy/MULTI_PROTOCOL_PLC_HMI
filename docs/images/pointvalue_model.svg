@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">PointValue統一資料模型</title>
+  <desc id="desc">Modbus RTU、Modbus TCP與OPC UA資料統一轉換成PointValue，提供給Tkinter HMI、ValueBus與DatabaseManager。</desc>
+  <defs>
+    <linearGradient id="header" x1="0" x2="1"><stop offset="0" stop-color="#0757c7"/><stop offset="1" stop-color="#073f98"/></linearGradient>
+    <linearGradient id="softBlue" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#f8fbff"/><stop offset="1" stop-color="#eaf3ff"/></linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#17365d" flood-opacity="0.18"/></filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#0757c7"/></marker>
+    <style>
+      .t{font-family:'Noto Sans TC','Microsoft JhengHei',Arial,sans-serif;fill:#111827}
+      .title{font-size:50px;font-weight:800;fill:#0a4ca6}
+      .subtitle{font-size:22px;fill:#374151}
+      .head{font-size:25px;font-weight:700;fill:#fff}
+      .section{font-size:20px;font-weight:700;fill:#0757c7}
+      .field{font-size:18px;fill:#111827}
+      .box{font-size:21px;font-weight:650;fill:#0a4ca6}
+      .panel{fill:#fff;stroke:#0757c7;stroke-width:2;filter:url(#shadow)}
+      .node{fill:url(#softBlue);stroke:#2f6fc9;stroke-width:1.8;filter:url(#shadow)}
+      .flow{fill:none;stroke:#0757c7;stroke-width:3.2;marker-end:url(#arrow)}
+    </style>
+  </defs>
+
+  <rect width="1600" height="900" fill="#fff"/>
+  <path d="M0 0H105L60 95H0Z" fill="#0757c7"/><path d="M55 0H140L90 95H30Z" fill="#7cb2f5" opacity=".75"/>
+  <text x="115" y="62" class="t title">PointValue 統一資料模型</text>
+  <text x="116" y="101" class="t subtitle">統一不同協定的讀取結果，提供一致的資料結構與欄位定義</text>
+  <line x1="110" y1="122" x2="1545" y2="122" stroke="#0757c7" stroke-width="3"/><circle cx="1545" cy="122" r="6" fill="#0757c7"/>
+
+  <!-- protocol sources -->
+  <g class="t box" text-anchor="middle">
+    <rect x="220" y="155" width="330" height="68" rx="12" class="node"/><text x="385" y="198">Modbus RTU 讀取結果</text>
+    <rect x="635" y="155" width="330" height="68" rx="12" class="node"/><text x="800" y="198">Modbus TCP 讀取結果</text>
+    <rect x="1050" y="155" width="330" height="68" rx="12" class="node"/><text x="1215" y="188"><tspan x="1215">OPC UA</tspan><tspan x="1215" dy="26">讀取 / 訂閱結果</tspan></text>
+  </g>
+  <path d="M385 223V248H770V270" class="flow"/><path d="M800 223V270" class="flow"/><path d="M1215 223V248H830V270" class="flow"/>
+
+  <!-- left groups -->
+  <g class="t">
+    <rect x="80" y="290" width="300" height="100" rx="12" class="panel"/><path d="M80 302a12 12 0 0 1 12-12h276a12 12 0 0 1 12 12v35H80Z" fill="url(#header)"/><text x="230" y="320" class="head" text-anchor="middle">識別資訊</text><text x="105" y="360" class="field">• point_key</text><text x="105" y="383" class="field">• protocol</text>
+    <rect x="80" y="410" width="300" height="100" rx="12" class="panel"/><path d="M80 422a12 12 0 0 1 12-12h276a12 12 0 0 1 12 12v35H80Z" fill="url(#header)"/><text x="230" y="440" class="head" text-anchor="middle">來源資訊</text><text x="105" y="480" class="field">• source_name</text><text x="105" y="503" class="field">• device_name</text>
+    <rect x="80" y="530" width="300" height="135" rx="12" class="panel"/><path d="M80 542a12 12 0 0 1 12-12h276a12 12 0 0 1 12 12v35H80Z" fill="url(#header)"/><text x="230" y="560" class="head" text-anchor="middle">點位資訊</text><text x="105" y="600" class="field">• point_name</text><text x="105" y="623" class="field">• address_text</text><text x="105" y="646" class="field">• data_type　• writable</text>
+    <rect x="80" y="685" width="300" height="145" rx="12" class="panel"/><path d="M80 697a12 12 0 0 1 12-12h276a12 12 0 0 1 12 12v35H80Z" fill="url(#header)"/><text x="230" y="715" class="head" text-anchor="middle">即時資料</text><text x="105" y="755" class="field">• value　• value_text</text><text x="105" y="778" class="field">• value_number</text><text x="105" y="801" class="field">• status_text　• timestamp</text>
+  </g>
+
+  <!-- central model -->
+  <rect x="505" y="270" width="610" height="505" rx="16" class="panel" stroke-width="3"/>
+  <path d="M505 286a16 16 0 0 1 16-16h578a16 16 0 0 1 16 16v54H505Z" fill="url(#header)"/>
+  <text x="810" y="313" class="t head" font-size="30" text-anchor="middle">PointValue</text>
+
+  <g class="t">
+    <rect x="525" y="355" width="570" height="70" rx="10" fill="#f8fbff" stroke="#b7d2f5"/>
+    <text x="550" y="386" class="section">識別資訊</text><text x="720" y="380" class="field">• point_key</text><text x="720" y="407" class="field">• protocol</text>
+
+    <rect x="525" y="435" width="570" height="70" rx="10" fill="#f8fbff" stroke="#b7d2f5"/>
+    <text x="550" y="466" class="section">來源資訊</text><text x="720" y="460" class="field">• source_name</text><text x="720" y="487" class="field">• device_name</text>
+
+    <rect x="525" y="515" width="570" height="95" rx="10" fill="#f8fbff" stroke="#b7d2f5"/>
+    <text x="550" y="558" class="section">點位資訊</text><text x="720" y="542" class="field">• point_name</text><text x="720" y="565" class="field">• address_text</text><text x="720" y="588" class="field">• data_type　• writable</text>
+
+    <rect x="525" y="620" width="570" height="105" rx="10" fill="#f8fbff" stroke="#b7d2f5"/>
+    <text x="550" y="674" class="section">即時資料</text><text x="720" y="647" class="field">• value　• value_text</text><text x="720" y="670" class="field">• value_number</text><text x="720" y="693" class="field">• status_text　• timestamp</text>
+
+    <rect x="525" y="735" width="570" height="28" rx="8" fill="#f8fbff" stroke="#b7d2f5"/>
+    <text x="550" y="756" class="section" font-size="18">延伸設定</text><text x="720" y="756" class="field">• raw_config</text>
+  </g>
+
+  <!-- left arrows -->
+  <path d="M380 340H490" class="flow"/><path d="M380 460H490" class="flow"/><path d="M380 595H490" class="flow"/><path d="M380 758H490" class="flow"/>
+
+  <!-- extension box -->
+  <rect x="1220" y="590" width="280" height="110" rx="12" class="panel"/>
+  <path d="M1220 602a12 12 0 0 1 12-12h256a12 12 0 0 1 12 12v38h-280Z" fill="url(#header)"/>
+  <text x="1360" y="622" class="t head" text-anchor="middle">延伸設定</text>
+  <text x="1250" y="675" class="t field">• raw_config</text>
+  <path d="M1220 646H1130" class="flow"/>
+
+  <!-- consumers -->
+  <path d="M810 775V805H350V820M810 805V820M810 805H1270V820" fill="none" stroke="#0757c7" stroke-width="3.2"/>
+  <g class="t box" text-anchor="middle">
+    <rect x="205" y="820" width="290" height="58" rx="12" class="node"/><text x="350" y="857">Tkinter HMI</text>
+    <rect x="665" y="820" width="290" height="58" rx="12" class="node"/><text x="810" y="857">ValueBus</text>
+    <rect x="1125" y="820" width="290" height="58" rx="12" class="node"/><text x="1270" y="857">DatabaseManager</text>
+  </g>
+  <path d="M350 805V816M810 805V816M1270 805V816" class="flow"/>
+</svg>
