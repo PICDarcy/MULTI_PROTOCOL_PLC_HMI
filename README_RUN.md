@@ -15,7 +15,8 @@
 ```text
 MULTI_PROTOCOL_PLC_HMI/
 ├─ main.py
-├─ config.json
+├─ config.example.json
+├─ config.json            # 本機建立，Git不追蹤
 ├─ requirements.txt
 ├─ README_RUN.md
 ├─ core/
@@ -60,9 +61,17 @@ python -m pip install -r requirements.txt
 - `asyncua`：OPC UA Client、訂閱與節點瀏覽。
 - `pymysql`：MySQL/MariaDB資料庫連線。
 
-## 5. 設定config.json
+## 5. 建立本機config.json
 
-請依現場設備修改以下三個主要區塊：
+首次執行前，請在專案根目錄複製安全範例：
+
+```powershell
+Copy-Item .\config.example.json .\config.json
+```
+
+`config.example.json`只保存可公開的示範值；`config.json`保存現場設備與
+資料庫設定，已由`.gitignore`排除，不會納入版本控制。請依現場設備修改
+以下四個主要區塊：
 
 - `database`：資料庫連線與自動寫入設定。
 - `modbus_rtu`：序列埠參數、PLC站號與Modbus點位。
@@ -73,9 +82,12 @@ python -m pip install -r requirements.txt
 
 ### 安全注意事項
 
-- 範例設定中的所有`password`欄位均為空字串。
+- `config.example.json`中的所有`password`與Token欄位必須保持空白。
 - 不要把正式密碼、GitHub Token、API Key或其他機密資料提交到GitHub。
-- 正式部署時建議使用環境變數或不納入版本控制的本機設定檔保存密碼。
+- 正式憑證只填在本機`config.json`。
+- 若`database.enable=true`，必須填寫`database.user`與`database.password`。
+- 若OPC UA Server啟用帳密登入，必須同時填寫該Server的`username`與`password`。
+- 啟動時缺少必要憑證，程式會停止啟動並只顯示缺少的欄位路徑，不顯示敏感值。
 
 ## 6. Modbus RTU設定重點
 
@@ -152,6 +164,18 @@ python main.py
 ```
 
 ## 10. 基本檢查
+
+檢查公開範例是否誤含密碼、Token或私鑰：
+
+```powershell
+python scripts/check_example_credentials.py
+```
+
+執行安全設定測試：
+
+```powershell
+python -m unittest tests.test_secure_config -v
+```
 
 檢查全部Python檔案是否有語法錯誤：
 

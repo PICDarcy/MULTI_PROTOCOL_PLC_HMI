@@ -60,6 +60,120 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+class MissingCredentialError(ValueError):
+    """已啟用功能缺少必要憑證。"""
+
+
+SENSITIVE_FIELD_NAMES = frozenset(
+    {
+        "password",
+        "passwd",
+        "pwd",
+        "secret",
+        "client_secret",
+        "token",
+        "access_token",
+        "refresh_token",
+        "api_key",
+        "apikey",
+        "private_key",
+    }
+)
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text == "true":
+            return True
+        if text == "false":
+            return False
+    raise ValueError("enable與use_username必須是JSON布林值true或false")
+
+
+def find_obvious_credentials(config: Mapping[str, Any]) -> tuple[str, ...]:
+    """找出設定中明顯的非空憑證，只回傳欄位路徑。"""
+    problems: list[str] = []
+
+    def has_value(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, (Mapping, list, tuple, set)):
+            return bool(value)
+        return True
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                key_text = str(key)
+                child_path = f"{path}.{key_text}" if path else key_text
+                normalized_key = key_text.strip().lower().replace("-", "_")
+                if normalized_key in SENSITIVE_FIELD_NAMES and has_value(child):
+                    problems.append(child_path)
+                    continue
+                visit(child, child_path)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, f"{path}[{index}]")
+
+    visit(config, "")
+    return tuple(problems)
+
+
+def find_missing_enabled_credentials(
+    config: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """回傳已啟用功能中缺少的憑證欄位路徑。"""
+    missing: list[str] = []
+
+    database = config.get("database", {})
+    if isinstance(database, Mapping) and _as_bool(database.get("enable")):
+        missing.extend(
+            f"database.{key}"
+            for key in ("user", "password")
+            if not str(database.get(key, "") or "").strip()
+        )
+
+    opcua = config.get("opcua", {})
+    if isinstance(opcua, Mapping) and _as_bool(opcua.get("enable")):
+        servers = opcua.get("servers", [])
+        if isinstance(servers, list):
+            for index, server in enumerate(servers):
+                if not isinstance(server, Mapping):
+                    continue
+                if not _as_bool(server.get("enable", True), True):
+                    continue
+                auth = (
+                    server.get("auth")
+                    if isinstance(server.get("auth"), Mapping)
+                    else {}
+                )
+                username = str(
+                    server.get("username", auth.get("username", "")) or ""
+                ).strip()
+                password = str(
+                    server.get("password", auth.get("password", "")) or ""
+                ).strip()
+                use_username = _as_bool(
+                    server.get("use_username", bool(username)),
+                    bool(username),
+                )
+                if not use_username:
+                    continue
+                if not username:
+                    missing.append(f"opcua.servers[{index}].username")
+                if not password:
+                    missing.append(f"opcua.servers[{index}].password")
+
+    return tuple(missing)
+
+
 class ConfigManager:
     """執行緒安全的JSON設定管理器。
 
@@ -120,6 +234,7 @@ class ConfigManager:
 
             if not self.config_path.exists():
                 self.config = copy.deepcopy(self._default_config)
+                self.require_enabled_credentials()
                 self.save_config()
                 return self.get_config()
 
@@ -131,10 +246,12 @@ class ConfigManager:
             except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
                 self._backup_invalid_config()
                 self.config = copy.deepcopy(self._default_config)
+                self.require_enabled_credentials()
                 self.save_config()
                 return self.get_config()
 
             self.config = self.deep_merge(self._default_config, loaded)
+            self.require_enabled_credentials()
             return self.get_config()
 
     def save_config(self, config: Mapping[str, Any] | None = None) -> bool:
@@ -182,6 +299,22 @@ class ConfigManager:
         """取得完整設定的深層副本。"""
         with self._lock:
             return copy.deepcopy(self.config)
+
+    def get_missing_enabled_credentials(self) -> tuple[str, ...]:
+        """取得已啟用功能中尚未填寫的必要憑證欄位。"""
+        with self._lock:
+            return find_missing_enabled_credentials(self.config)
+
+    def require_enabled_credentials(self) -> None:
+        """缺少必要憑證時停止載入，錯誤訊息只列欄位、不列值。"""
+        missing = self.get_missing_enabled_credentials()
+        if not missing:
+            return
+        fields = "、".join(missing)
+        raise MissingCredentialError(
+            f"已啟用功能缺少必要憑證：{fields}。"
+            "請在未納入版本控制的config.json補齊後再啟動。"
+        )
 
     def get_section(self, section_name: str, default: Any = None) -> Any:
         """取得指定設定區段的深層副本。"""
