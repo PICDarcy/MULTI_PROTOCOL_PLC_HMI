@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import struct
 import threading
 import time
 from collections.abc import Mapping
@@ -12,6 +11,7 @@ from typing import Any
 
 from .data_model import PointValue, make_modbus_point_key
 from .gateway_security import ReadonlyGatewayPolicy
+from .modbus_codec import decode_modbus_value
 
 PROTOCOL_MODBUS = "MODBUS_RTU"
 
@@ -196,53 +196,12 @@ class ModbusRtuManager:
             return self._read_raw_unlocked(client, device, point)
 
     @staticmethod
-    def _ordered_bytes(registers: list[int], data_type: str) -> bytes:
-        raw = b"".join(struct.pack(">H", int(value) & 0xFFFF) for value in registers)
-        normalized = data_type.upper().replace("-", "_")
-        suffix = normalized.rsplit("_", 1)[-1]
-        if suffix not in {"ABCD", "BADC", "CDAB", "DCBA"}:
-            suffix = "ABCD"
-        if suffix in {"BADC", "DCBA"}:
-            raw = b"".join(raw[index : index + 2][::-1] for index in range(0, len(raw), 2))
-        if suffix in {"CDAB", "DCBA"} and len(raw) >= 4:
-            words = [raw[index : index + 2] for index in range(0, len(raw), 2)]
-            raw = b"".join(reversed(words))
-        return raw
-
-    @classmethod
-    def _decode(cls, raw_values: list[Any], data_type: str, point_type: str):
-        normalized = str(data_type or "Auto").upper().replace("-", "_")
-        if point_type in {"coil", "discrete_input"}:
-            values = [bool(value) for value in raw_values]
-            return values[0] if len(values) == 1 else values
-        registers = [int(value) & 0xFFFF for value in raw_values]
-        raw = cls._ordered_bytes(registers, normalized)
-        base = normalized.split("_", 1)[0]
-        if base in {"AUTO", "UINT16"}:
-            return registers[0] if len(registers) == 1 else registers
-        if base in {"BOOL", "BOOLEAN"}:
-            return bool(registers[0])
-        if base == "INT16":
-            return struct.unpack(">h", raw[:2])[0]
-        formats = {
-            "UINT32": ">I",
-            "INT32": ">i",
-            "FLOAT32": ">f",
-            "UINT64": ">Q",
-            "INT64": ">q",
-            "FLOAT64": ">d",
-            "DOUBLE": ">d",
-        }
-        if base in formats:
-            size = struct.calcsize(formats[base])
-            if len(raw) < size:
-                raise ValueError(f"{data_type}需要{size // 2}個Register")
-            return struct.unpack(formats[base], raw[:size])[0]
-        if base == "STRING":
-            return raw.rstrip(b"\x00").decode("utf-8", errors="replace")
-        if base == "RAW":
-            return registers
-        raise ValueError(f"不支援的Modbus data_type：{data_type}")
+    def _decode(raw_values: list[Any], data_type: str, point_type: str):
+        return decode_modbus_value(
+            raw_values,
+            data_type,
+            area=point_type,
+        )
 
     @staticmethod
     def _value_text(value: Any) -> str:
@@ -314,7 +273,7 @@ class ModbusRtuManager:
                     value = self._decode(
                         raw,
                         str(point.get("data_type", "Auto")),
-                        str(point.get("type", "")),
+                        str(point.get("type", "holding_register")),
                     )
                     self._publish(device, point, value, "Good")
                     success += 1
