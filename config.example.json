@@ -7,6 +7,7 @@
   },
   "modbus_rtu": {
     "enable": false,
+    "connection_id": "conn-modbus-rtu-example",
     "port": "COM3",
     "baudrate": 9600,
     "bytesize": 8,
@@ -18,33 +19,44 @@
       {
         "enable": true,
         "name": "範例Modbus_RTU_PLC",
+        "device_id": "device-modbus-rtu-example",
         "station_id": 1,
         "points": [
           {
             "enable": true,
             "name": "範例保持暫存器",
+            "tag_id": "tag-rtu-holding-register",
             "type": "holding_register",
             "address": 0,
+            "address_base": 0,
             "count": 1,
             "data_type": "UInt16",
+            "byte_order": "big",
+            "word_order": "big",
             "writable": false,
             "db_enable": true
           },
           {
             "enable": true,
             "name": "範例輸入暫存器",
+            "tag_id": "tag-rtu-input-register",
             "type": "input_register",
             "address": 10,
+            "address_base": 0,
             "count": 2,
             "data_type": "Float32_ABCD",
+            "byte_order": "big",
+            "word_order": "big",
             "writable": false,
             "db_enable": true
           },
           {
             "enable": true,
             "name": "範例線圈",
+            "tag_id": "tag-rtu-coil",
             "type": "coil",
             "address": 0,
+            "address_base": 0,
             "count": 1,
             "data_type": "Bool",
             "writable": false,
@@ -53,8 +65,10 @@
           {
             "enable": true,
             "name": "範例離散輸入",
+            "tag_id": "tag-rtu-discrete-input",
             "type": "discrete_input",
             "address": 0,
+            "address_base": 0,
             "count": 1,
             "data_type": "Bool",
             "writable": false,
