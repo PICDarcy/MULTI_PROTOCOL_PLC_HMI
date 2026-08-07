@@ -42,6 +42,18 @@ class EnabledCredentialValidationTests(unittest.TestCase):
 
         self.assertEqual((), missing)
 
+    def test_unknown_text_enable_value_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "JSON布林值"):
+            config_manager.find_missing_enabled_credentials(
+                {
+                    "database": {
+                        "enable": "flase",
+                        "user": "",
+                        "password": "",
+                    }
+                }
+            )
+
     def test_enabled_opcua_username_login_requires_both_credentials(self):
         missing = config_manager.find_missing_enabled_credentials(
             {

@@ -86,15 +86,13 @@ def _as_bool(value: Any, default: bool = False) -> bool:
         return default
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
-        return bool(value)
     if isinstance(value, str):
         text = value.strip().lower()
-        if text in {"1", "true", "yes", "y", "on", "是", "啟用"}:
+        if text == "true":
             return True
-        if text in {"0", "false", "no", "n", "off", "否", "停用"}:
+        if text == "false":
             return False
-    return bool(value)
+    raise ValueError("enable與use_username必須是JSON布林值true或false")
 
 
 def find_obvious_credentials(config: Mapping[str, Any]) -> tuple[str, ...]:
