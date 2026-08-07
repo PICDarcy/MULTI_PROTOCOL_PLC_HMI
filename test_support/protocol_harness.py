@@ -12,11 +12,13 @@ from typing import Any
 from asyncua import Client, Server, ua
 
 from core.config_manager import ConfigManager
+from core.data_model import make_opcua_point_key
 from core.gateway_modbus_server import GatewayModbusTcpServer
 from core.gateway_runtime import GatewayOutputRuntime
 from core.modbus_tcp_manager import ModbusTcpManager
 from core.opcua_manager import OpcuaMultiServerManager
 from core.value_bus import ValueBus
+
 
 class _OpcuaSourceRuntime:
     """在專屬 event loop 執行模擬 OPC UA 來源。"""
@@ -27,6 +29,10 @@ class _OpcuaSourceRuntime:
         self.server = Server()
         self.node_id: ua.NodeId | None = None
         self.node = None
+        self.boolean_node_id: ua.NodeId | None = None
+        self.boolean_node = None
+        self.uint16_node_id: ua.NodeId | None = None
+        self.uint16_node = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
@@ -88,6 +94,24 @@ class _OpcuaSourceRuntime:
         )
         self.node = node
         self.node_id = node.nodeid
+        boolean_node = await self.server.nodes.objects.add_variable(
+            ua.NodeId("simulated-running", namespace),
+            ua.QualifiedName("Running", namespace),
+            False,
+            ua.VariantType.Boolean,
+        )
+        uint16_node = await self.server.nodes.objects.add_variable(
+            ua.NodeId("simulated-count", namespace),
+            ua.QualifiedName("Count", namespace),
+            0,
+            ua.VariantType.UInt16,
+        )
+        await boolean_node.set_writable()
+        await uint16_node.set_writable()
+        self.boolean_node = boolean_node
+        self.boolean_node_id = boolean_node.nodeid
+        self.uint16_node = uint16_node
+        self.uint16_node_id = uint16_node.nodeid
         await self.server.start()
         self.port = int(self.server.bserver.port)
         self.endpoint = f"opc.tcp://127.0.0.1:{self.port}"
@@ -131,6 +155,7 @@ class LocalProtocolHarness:
         opcua_subscribe: bool = True,
         opcua_poll_interval: float = 0.1,
         modbus_points: list[dict[str, Any]] | None = None,
+        auto_start_opcua_collection: bool = False,
     ) -> None:
         self._requested_ports = {
             "modbus_source": int(modbus_source_port),
@@ -142,6 +167,7 @@ class LocalProtocolHarness:
         self._opcua_subscribe = bool(opcua_subscribe)
         self._opcua_poll_interval = float(opcua_poll_interval)
         self._modbus_points = copy.deepcopy(modbus_points)
+        self._auto_start_opcua_collection = bool(auto_start_opcua_collection)
         self._config_path: Path | None = None
         self.config_manager: ConfigManager | None = None
         self.value_bus: ValueBus | None = None
@@ -179,6 +205,24 @@ class LocalProtocolHarness:
         if runtime is None or runtime.modbus_server is None:
             raise RuntimeError("Gateway Modbus輸出尚未啟動")
         return runtime.modbus_server.port
+
+    @property
+    def opcua_source_endpoint(self) -> str:
+        if self.opcua_source is None:
+            raise RuntimeError("模擬OPC UA來源尚未啟動")
+        return self.opcua_source.endpoint
+
+    @property
+    def opcua_boolean_node_id(self) -> ua.NodeId:
+        if self.opcua_source is None or self.opcua_source.boolean_node_id is None:
+            raise RuntimeError("模擬OPC UA Boolean來源尚未啟動")
+        return self.opcua_source.boolean_node_id
+
+    @property
+    def opcua_uint16_node_id(self) -> ua.NodeId:
+        if self.opcua_source is None or self.opcua_source.uint16_node_id is None:
+            raise RuntimeError("模擬OPC UA UInt16來源尚未啟動")
+        return self.opcua_source.uint16_node_id
 
     @property
     def ports(self) -> dict[str, int]:
@@ -239,7 +283,11 @@ class LocalProtocolHarness:
                 self.value_bus,
                 self._capture_log,
             )
-            self.gateway_runtime = GatewayOutputRuntime(self.config_manager)
+            self.gateway_runtime = GatewayOutputRuntime(
+                self.config_manager,
+                self._capture_log,
+                self.value_bus,
+            )
             self.gateway_runtime.start()
             if self.gateway_runtime.opcua_server is None:
                 raise RuntimeError("Gateway OPC UA輸出未建立")
@@ -251,6 +299,8 @@ class LocalProtocolHarness:
                 }
             )
             self.value_bus.subscribe(self._bridge_modbus_value)
+            if self._auto_start_opcua_collection:
+                self.opcua_manager.subscribe_all().result(timeout=5)
             self._running = True
         except BaseException:
             self.stop()
@@ -409,6 +459,30 @@ class LocalProtocolHarness:
                                 "node_id": self.opcua_source.node_id.to_string(),
                                 "data_type": "Double",
                                 "subscribe": self._opcua_subscribe,
+                            },
+                            {
+                                "enable": True,
+                                "name": "Running",
+                                "tag_id": "tag-simulated-running",
+                                "connection_id": "conn-simulated-opcua",
+                                "device_id": "device-simulated-opcua",
+                                "node_id": (
+                                    self.opcua_source.boolean_node_id.to_string()
+                                ),
+                                "data_type": "Boolean",
+                                "subscribe": self._opcua_subscribe,
+                            },
+                            {
+                                "enable": True,
+                                "name": "Count",
+                                "tag_id": "tag-simulated-count",
+                                "connection_id": "conn-simulated-opcua",
+                                "device_id": "device-simulated-opcua",
+                                "node_id": (
+                                    self.opcua_source.uint16_node_id.to_string()
+                                ),
+                                "data_type": "UInt16",
+                                "subscribe": self._opcua_subscribe,
                             }
                         ],
                     }
@@ -454,6 +528,64 @@ class LocalProtocolHarness:
                         f"opc.tcp://127.0.0.1:{self._gateway_opcua_port}"
                     ),
                 },
+            },
+            "gateway_model": {
+                "connections": [
+                    {
+                        "connection_id": "conn-simulated-opcua",
+                        "name": "Simulated OPC UA Connection",
+                        "protocol": "OPCUA",
+                        "settings": {"endpoint": self.opcua_source.endpoint},
+                    }
+                ],
+                "devices": [
+                    {
+                        "device_id": "device-simulated-opcua",
+                        "connection_id": "conn-simulated-opcua",
+                        "name": "Simulated OPC UA Device",
+                    }
+                ],
+                "tags": [
+                    {
+                        "tag_id": "tag-simulated-running",
+                        "point_key": make_opcua_point_key(
+                            "Simulated OPC UA Source",
+                            self.opcua_source.boolean_node_id.to_string(),
+                        ),
+                        "connection_id": "conn-simulated-opcua",
+                        "device_id": "device-simulated-opcua",
+                        "name": "Running",
+                        "source_protocol": "OPCUA",
+                        "source_address": (
+                            self.opcua_source.boolean_node_id.to_string()
+                        ),
+                        "data_type": "Boolean",
+                        "modbus_tcp_output": {
+                            "enabled": True,
+                            "address": 0,
+                        },
+                    },
+                    {
+                        "tag_id": "tag-simulated-count",
+                        "point_key": make_opcua_point_key(
+                            "Simulated OPC UA Source",
+                            self.opcua_source.uint16_node_id.to_string(),
+                        ),
+                        "connection_id": "conn-simulated-opcua",
+                        "device_id": "device-simulated-opcua",
+                        "name": "Count",
+                        "source_protocol": "OPCUA",
+                        "source_address": (
+                            self.opcua_source.uint16_node_id.to_string()
+                        ),
+                        "data_type": "UInt16",
+                        "modbus_tcp_output": {
+                            "enabled": True,
+                            "area": "holding_register",
+                            "address": 100,
+                        },
+                    },
+                ],
             },
         }
 

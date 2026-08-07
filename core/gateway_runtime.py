@@ -9,6 +9,7 @@ from typing import Any
 
 from asyncua import ua
 
+from .gateway_modbus_adapter import GatewayModbusOutputAdapter
 from .gateway_modbus_server import GatewayModbusTcpServer
 from .gateway_opcua_server import GatewayOpcuaServer
 
@@ -16,10 +17,12 @@ from .gateway_opcua_server import GatewayOpcuaServer
 class GatewayOutputRuntime:
     """依設定啟停 Modbus TCP／OPC UA 輸出並保證完整清理。"""
 
-    def __init__(self, config_manager, log_func=None) -> None:
+    def __init__(self, config_manager, log_func=None, value_bus=None) -> None:
         self.config_manager = config_manager
         self.log_callback = log_func
+        self.value_bus = value_bus
         self.modbus_server: GatewayModbusTcpServer | None = None
+        self.modbus_adapter: GatewayModbusOutputAdapter | None = None
         self.opcua_server: GatewayOpcuaServer | None = None
         self.opcua_system_node_id: ua.NodeId | None = None
         self._opcua_loop: asyncio.AbstractEventLoop | None = None
@@ -50,6 +53,14 @@ class GatewayOutputRuntime:
                         target="gateway/system/read_only",
                     )
                     self.modbus_server.start()
+                    if self.value_bus is not None:
+                        self.modbus_adapter = GatewayModbusOutputAdapter(
+                            self.config_manager,
+                            self.value_bus,
+                            self.modbus_server,
+                            self.log_callback,
+                        )
+                        self.modbus_adapter.start()
 
                 if self._enabled(opcua):
                     self._start_opcua(
@@ -71,9 +82,12 @@ class GatewayOutputRuntime:
             if not self._running and self.modbus_server is None and self.opcua_server is None:
                 return
             self._running = False
+            modbus_adapter, self.modbus_adapter = self.modbus_adapter, None
             modbus, self.modbus_server = self.modbus_server, None
             loop = self._opcua_loop
             thread, self._opcua_thread = self._opcua_thread, None
+        if modbus_adapter is not None:
+            modbus_adapter.stop()
         if modbus is not None:
             modbus.stop()
         if loop is not None and loop.is_running():

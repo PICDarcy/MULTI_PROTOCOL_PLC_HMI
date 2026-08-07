@@ -508,14 +508,17 @@ class ModbusTcpOutputMapping:
     """單一 Canonical Tag 的 Modbus TCP 輸出映射。"""
 
     enabled: bool = False
-    area: str = "holding_register"
+    area: str | None = None
     address: int | None = None
+    _area_was_default: bool = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        area_was_default = self.area is None or not str(self.area).strip()
         area = str(self.area or "holding_register").strip().lower()
         if area not in {"coil", "holding_register"}:
             raise ValueError("Modbus TCP輸出area只允許coil或holding_register")
         object.__setattr__(self, "area", area)
+        object.__setattr__(self, "_area_was_default", area_was_default)
         object.__setattr__(self, "enabled", bool(self.enabled))
         if self.enabled and self.address is None:
             raise ValueError("啟用Modbus TCP輸出時address不可為空")
@@ -537,7 +540,7 @@ class ModbusTcpOutputMapping:
         data = value if isinstance(value, Mapping) else {}
         return cls(
             enabled=data.get("enabled", False),
-            area=data.get("area", "holding_register"),
+            area=data.get("area"),
             address=data.get("address"),
         )
 
@@ -621,6 +624,19 @@ class CanonicalTag:
         object.__setattr__(self, "enabled", bool(self.enabled))
         if not isinstance(self.modbus_tcp_output, ModbusTcpOutputMapping):
             raise TypeError("modbus_tcp_output型別錯誤")
+        if (
+            self.data_type == "Boolean"
+            and self.modbus_tcp_output._area_was_default
+        ):
+            object.__setattr__(
+                self,
+                "modbus_tcp_output",
+                ModbusTcpOutputMapping(
+                    enabled=self.modbus_tcp_output.enabled,
+                    area="coil",
+                    address=self.modbus_tcp_output.address,
+                ),
+            )
         if not isinstance(self.opcua_output, OpcuaOutputMapping):
             raise TypeError("opcua_output型別錯誤")
         if not isinstance(self.metadata, Mapping):
