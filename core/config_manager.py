@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from .data_model import GatewayModel
+
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "app": {
@@ -54,6 +56,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enable": False,
             "endpoint": "opc.tcp://127.0.0.1:4841",
         },
+    },
+    "gateway_model": {
+        "connections": [],
+        "devices": [],
+        "tags": [],
     },
     "database": {
         "enable": False,
@@ -354,6 +361,16 @@ class ConfigManager:
             self.config[section_name] = updated
             self.save_config()
             return copy.deepcopy(updated)
+
+    def get_gateway_model(self) -> GatewayModel:
+        """將 canonical 設定反序列化為一致性模型。"""
+        return GatewayModel.from_dict(self.get_section("gateway_model", {}))
+
+    def set_gateway_model(self, model: GatewayModel) -> None:
+        """保存 canonical 模型；實際寫檔仍由既有 save_config 控制。"""
+        if not isinstance(model, GatewayModel):
+            raise TypeError("model必須是GatewayModel")
+        self.set_section("gateway_model", model.to_dict())
 
     def reload(self) -> dict[str, Any]:
         """重新從磁碟載入設定。"""
