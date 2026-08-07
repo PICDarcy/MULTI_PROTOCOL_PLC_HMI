@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
 from typing import Any
+from urllib.parse import urlsplit
 
 from asyncua import Server, ua
 from asyncua.crypto.permission_rules import User, UserRole
@@ -89,6 +90,15 @@ class GatewayOpcuaServer:
         self._namespace_index: int | None = None
         self._started = False
         self._original_write = None
+
+    @property
+    def port(self) -> int:
+        """回傳實際監聽 port，支援 endpoint 指定 port 0。"""
+        binary_server = getattr(self._server, "bserver", None)
+        bound_port = getattr(binary_server, "port", None)
+        if bound_port is not None:
+            return int(bound_port)
+        return int(urlsplit(self.endpoint).port or 0)
 
     async def start(self) -> None:
         if self._started:
