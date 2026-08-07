@@ -72,6 +72,8 @@
       {
         "enable": true,
         "name": "範例Modbus_TCP_PLC",
+        "connection_id": "conn-modbus-tcp-example",
+        "device_id": "device-modbus-tcp-example",
         "host": "192.0.2.10",
         "port": 502,
         "station_id": 1,
@@ -79,18 +81,24 @@
           {
             "enable": true,
             "name": "範例生產數量",
+            "tag_id": "tag-production-count",
             "type": "holding_register",
             "address": 0,
+            "address_base": 0,
             "count": 1,
             "data_type": "UInt16",
+            "byte_order": "big",
+            "word_order": "big",
             "writable": false,
             "db_enable": true
           },
           {
             "enable": true,
             "name": "範例運轉狀態",
+            "tag_id": "tag-running",
             "type": "coil",
             "address": 0,
+            "address_base": 0,
             "count": 1,
             "data_type": "Bool",
             "writable": false,

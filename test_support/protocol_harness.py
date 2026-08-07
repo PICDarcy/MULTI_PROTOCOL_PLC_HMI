@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import tempfile
 import threading
 from pathlib import Path
@@ -129,6 +130,7 @@ class LocalProtocolHarness:
         gateway_opcua_port: int = 0,
         opcua_subscribe: bool = True,
         opcua_poll_interval: float = 0.1,
+        modbus_points: list[dict[str, Any]] | None = None,
     ) -> None:
         self._requested_ports = {
             "modbus_source": int(modbus_source_port),
@@ -139,6 +141,7 @@ class LocalProtocolHarness:
         self._temporary_directory: tempfile.TemporaryDirectory[str] | None = None
         self._opcua_subscribe = bool(opcua_subscribe)
         self._opcua_poll_interval = float(opcua_poll_interval)
+        self._modbus_points = copy.deepcopy(modbus_points)
         self._config_path: Path | None = None
         self.config_manager: ConfigManager | None = None
         self.value_bus: ValueBus | None = None
@@ -298,6 +301,32 @@ class LocalProtocolHarness:
             raise RuntimeError("測試環境尚未啟動")
         return self.modbus_manager.read_all_once()
 
+    def set_modbus_source_registers(
+        self,
+        address: int,
+        values: list[int],
+    ) -> None:
+        if self.modbus_source is None:
+            raise RuntimeError("測試環境尚未啟動")
+        self.modbus_source.set_holding_registers(
+            address,
+            values,
+            target="simulated/modbus/registers",
+        )
+
+    def set_modbus_source_coils(
+        self,
+        address: int,
+        values: list[bool],
+    ) -> None:
+        if self.modbus_source is None:
+            raise RuntimeError("測試環境尚未啟動")
+        self.modbus_source.set_coils(
+            address,
+            values,
+            target="simulated/modbus/coils",
+        )
+
     def poll_opcua_source_once(self) -> dict[str, Any]:
         if self.opcua_manager is None or self.opcua_source is None:
             raise RuntimeError("測試環境尚未啟動")
@@ -393,10 +422,14 @@ class LocalProtocolHarness:
                     {
                         "enable": True,
                         "name": "Simulated Modbus Source",
+                        "connection_id": "conn-simulated-modbus",
+                        "device_id": "device-simulated-modbus",
                         "host": "127.0.0.1",
                         "port": self.modbus_source_port,
                         "station_id": 1,
-                        "points": [
+                        "points": self._modbus_points
+                        if self._modbus_points is not None
+                        else [
                             {
                                 "enable": True,
                                 "name": "Temperature",
@@ -433,9 +466,16 @@ class LocalProtocolHarness:
             or point_value.status_text != "Good"
         ):
             return
+        value = point_value.value
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= 0xFFFF
+        ):
+            return
         runtime.modbus_server.set_holding_registers(
             100,
-            [int(point_value.value)],
+            [value],
             target=point_value.point_key,
         )
 

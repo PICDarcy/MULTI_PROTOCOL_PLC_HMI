@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
 from .data_model import PointValue, make_modbus_tcp_point_key
+from .modbus_codec import decode_modbus_value, register_count_for_type
 from .modbus_manager import ModbusRtuManager
 
 PROTOCOL_MODBUS_TCP = "MODBUS_TCP"
@@ -87,13 +89,25 @@ class ModbusTcpManager(ModbusRtuManager):
 
     def _point_key(self, device: Mapping[str, Any], point: Mapping[str, Any]) -> str:
         source = f"{self._endpoint(device)}|{device.get('name', '')}"
-        return make_modbus_tcp_point_key(
-            source,
-            int(device.get("station_id", 1)),
-            str(point.get("type", "holding_register")),
-            int(point.get("address", 0)),
-            str(point.get("name", "")),
-        )
+        try:
+            return make_modbus_tcp_point_key(
+                source,
+                int(device.get("station_id", 1)),
+                str(point.get("type", "holding_register")),
+                int(point.get("address", 0)),
+                str(point.get("name", "")),
+            )
+        except (TypeError, ValueError):
+            return "::".join(
+                (
+                    "MODBUS_TCP_CONFIG_ERROR",
+                    quote(source, safe=""),
+                    quote(str(device.get("station_id", 1)), safe=""),
+                    quote(str(point.get("type", "holding_register")), safe=""),
+                    quote(str(point.get("address", 0)), safe=""),
+                    quote(str(point.get("name", "")), safe=""),
+                )
+            )
 
     def _make_client(self, device: Mapping[str, Any]):
         try:
@@ -159,8 +173,27 @@ class ModbusTcpManager(ModbusRtuManager):
         point: Mapping[str, Any],
         value: Any,
         status: str,
+        *,
+        source_timestamp: datetime | None = None,
+        server_timestamp: datetime | None = None,
+        diagnostics: Mapping[str, Any] | None = None,
     ):
         endpoint = self._endpoint(device)
+        point_key = self._point_key(device, point)
+        tag_id = str(point.get("tag_id", "") or point_key)
+        connection_id = str(
+            point.get("connection_id", "")
+            or device.get("connection_id", "")
+            or f"modbus-tcp-connection:{endpoint}"
+        )
+        device_id = str(
+            point.get("device_id", "")
+            or device.get("device_id", "")
+            or f"modbus-tcp-device:{endpoint}:{device.get('station_id', 1)}"
+        )
+        area = str(point.get("type", "holding_register")).strip().lower()
+        source_time = source_timestamp or datetime.now(timezone.utc)
+        gateway_time = server_timestamp or datetime.now(timezone.utc)
         raw_config = dict(point)
         raw_config.update(
             {
@@ -168,10 +201,17 @@ class ModbusTcpManager(ModbusRtuManager):
                 "host": self._device_host(device),
                 "port": self._device_port(device),
                 "device_name": str(device.get("name", "")),
+                "source_area": area,
+                "pdu_address": point.get("address", 0),
+                "address_base": 0,
+                "byte_order": str(point.get("byte_order", "big")),
+                "word_order": str(point.get("word_order", "big")),
             }
         )
+        if diagnostics:
+            raw_config.update(dict(diagnostics))
         point_value = PointValue(
-            point_key=self._point_key(device, point),
+            point_key=point_key,
             protocol=PROTOCOL_MODBUS_TCP,
             source_name=endpoint,
             device_name=str(device.get("name", "")),
@@ -184,13 +224,104 @@ class ModbusTcpManager(ModbusRtuManager):
             value_text=self._value_text(value),
             value_number=self._value_number(value),
             status_text=status,
-            timestamp=datetime.now(),
+            timestamp=source_time,
             writable=self._as_bool(point.get("writable", False), False),
             data_type=str(point.get("data_type", "Auto")),
             raw_config=raw_config,
+            tag_id=tag_id,
+            connection_id=connection_id,
+            device_id=device_id,
+            quality="Good" if status == "Good" else "Bad",
+            source_timestamp=source_time,
+            server_timestamp=gateway_time,
+            gateway_timestamp=gateway_time,
         )
         self.value_bus.publish(point_value)
         return point_value
+
+    @staticmethod
+    def _point_area(point: Mapping[str, Any]) -> str:
+        area = str(point.get("type", "holding_register")).strip().lower()
+        if area not in {
+            "coil",
+            "discrete_input",
+            "input_register",
+            "holding_register",
+        }:
+            raise ValueError(f"不支援的Modbus資料區：{area}")
+        return area
+
+    @classmethod
+    def _point_count(cls, point: Mapping[str, Any]) -> int:
+        required = register_count_for_type(
+            point.get("data_type", "Auto"),
+            area=cls._point_area(point),
+        )
+        configured = int(point.get("count", required))
+        if configured < required:
+            raise ValueError(
+                f"{point.get('data_type', 'Auto')}至少需要{required}個值"
+            )
+        limit = 2000 if cls._point_area(point) in {"coil", "discrete_input"} else 125
+        if configured > limit:
+            raise ValueError(f"單次Modbus讀取數量不可超過{limit}")
+        return configured
+
+    @classmethod
+    def _point_record(
+        cls,
+        point: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], int, int]:
+        cls._point_area(point)
+        if int(point.get("address_base", 0)) != 0:
+            raise ValueError("Modbus來源只接受0-based PDU address")
+        address = int(point.get("address", 0))
+        if not 0 <= address <= 65535:
+            raise ValueError("Modbus PDU address必須介於0到65535")
+        count = cls._point_count(point)
+        if address + count > 65536:
+            raise ValueError("Modbus PDU address加count不可超過65536")
+        return point, address, count
+
+    @classmethod
+    def _read_groups(
+        cls,
+        points: list[Mapping[str, Any]],
+    ) -> list[tuple[str, int, int, list[tuple[Mapping[str, Any], int, int]]]]:
+        by_area: dict[str, list[tuple[Mapping[str, Any], int, int]]] = {}
+        for point in points:
+            record = cls._point_record(point)
+            by_area.setdefault(cls._point_area(point), []).append(record)
+
+        groups = []
+        for area, records in by_area.items():
+            limit = 2000 if area in {"coil", "discrete_input"} else 125
+            current: list[tuple[Mapping[str, Any], int, int]] = []
+            start = end = 0
+            for record in sorted(records, key=lambda item: item[1]):
+                _, address, count = record
+                record_end = address + count
+                if current and (address > end or record_end - start > limit):
+                    groups.append((area, start, end - start, current))
+                    current = []
+                if not current:
+                    start, end = address, record_end
+                else:
+                    end = max(end, record_end)
+                current.append(record)
+            if current:
+                groups.append((area, start, end - start, current))
+        return groups
+
+    @staticmethod
+    def _decode_point(raw_values, point: Mapping[str, Any]) -> Any:
+        return decode_modbus_value(
+            list(raw_values),
+            point.get("data_type", "Auto"),
+            area=str(point.get("type", "holding_register")),
+            byte_order=point.get("byte_order"),
+            word_order=point.get("word_order"),
+        )
 
     def read_all_once(self):
         success = 0
@@ -234,7 +365,31 @@ class ModbusTcpManager(ModbusRtuManager):
                 failed += len(points)
                 continue
 
+            valid_points = []
             for point in points:
+                try:
+                    self._point_record(point)
+                    valid_points.append(point)
+                except Exception as exc:
+                    failure_time = datetime.now(timezone.utc)
+                    self._publish(
+                        device,
+                        point,
+                        None,
+                        f"設定錯誤：{exc}",
+                        source_timestamp=failure_time,
+                        server_timestamp=failure_time,
+                        diagnostics={"error": str(exc)},
+                    )
+                    self._log(
+                        f"Modbus TCP點位「{point.get('name', '')}」"
+                        f"設定錯誤：{exc}",
+                        "ERROR",
+                    )
+                    failed += 1
+            groups = self._read_groups(valid_points)
+
+            for area, response_address, response_count, records in groups:
                 if self._stop_event.is_set():
                     break
                 try:
@@ -247,22 +402,81 @@ class ModbusTcpManager(ModbusRtuManager):
                                     "total": success + failed,
                                 }
                         client = self._ensure_client_unlocked(device)
-                        raw = self._read_raw_unlocked(client, device, point)
-                    value = self._decode(
-                        raw,
-                        str(point.get("data_type", "Auto")),
-                        str(point.get("type", "")),
-                    )
-                    self._publish(device, point, value, "Good")
-                    success += 1
+                        raw = self._read_raw_unlocked(
+                            client,
+                            device,
+                            {
+                                "type": area,
+                                "address": response_address,
+                                "count": response_count,
+                            },
+                        )
+                    source_timestamp = datetime.now(timezone.utc)
                 except Exception as exc:
-                    self._publish(device, point, None, f"讀取失敗：{exc}")
+                    failed_time = datetime.now(timezone.utc)
+                    for point, _, _ in records:
+                        self._publish(
+                            device,
+                            point,
+                            None,
+                            f"讀取失敗：{exc}",
+                            source_timestamp=failed_time,
+                            server_timestamp=datetime.now(timezone.utc),
+                            diagnostics={
+                                "response_address": response_address,
+                                "response_count": response_count,
+                                "error": str(exc),
+                            },
+                        )
                     self._log(
-                        f"Modbus TCP「{self._endpoint(device)}」點位"
-                        f"「{point.get('name', '')}」讀取失敗：{exc}",
+                        f"Modbus TCP「{self._endpoint(device)}」資料區"
+                        f"「{area}」讀取失敗：{exc}",
                         "ERROR",
                     )
-                    failed += 1
+                    failed += len(records)
+                    continue
+
+                for point, address, count in records:
+                    offset = address - response_address
+                    point_raw = raw[offset : offset + count]
+                    try:
+                        value = self._decode_point(point_raw, point)
+                        gateway_timestamp = datetime.now(timezone.utc)
+                        self._publish(
+                            device,
+                            point,
+                            value,
+                            "Good",
+                            source_timestamp=source_timestamp,
+                            server_timestamp=gateway_timestamp,
+                            diagnostics={
+                                "response_address": response_address,
+                                "response_count": response_count,
+                                "raw_values": list(point_raw),
+                            },
+                        )
+                        success += 1
+                    except Exception as exc:
+                        self._publish(
+                            device,
+                            point,
+                            None,
+                            f"解碼失敗：{exc}",
+                            source_timestamp=source_timestamp,
+                            server_timestamp=datetime.now(timezone.utc),
+                            diagnostics={
+                                "response_address": response_address,
+                                "response_count": response_count,
+                                "raw_values": list(point_raw),
+                                "error": str(exc),
+                            },
+                        )
+                        self._log(
+                            f"Modbus TCP點位「{point.get('name', '')}」"
+                            f"解碼失敗：{exc}",
+                            "ERROR",
+                        )
+                        failed += 1
         return {"success": success, "failed": failed, "total": success + failed}
 
     def write_point(self, point_key, value_text):
