@@ -335,10 +335,8 @@ class ModbusTcpPage(ModbusPage):
                 point["data_type"] = str(
                     point.get("data_type") or "uint16"
                 )
-                point["writable"] = bool(point.get("writable", False))
+                point["writable"] = False
                 point["db_enable"] = bool(point.get("db_enable", False))
-                if point["type"] in READ_ONLY_TYPES:
-                    point["writable"] = False
                 points.append(point)
             device["points"] = points
             devices.append(device)

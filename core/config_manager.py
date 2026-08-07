@@ -44,6 +44,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enable": False,
         "servers": [],
     },
+    "gateway_outputs": {
+        "modbus_tcp_server": {
+            "enable": False,
+            "host": "127.0.0.1",
+            "port": 1502,
+        },
+        "opcua_server": {
+            "enable": False,
+            "endpoint": "opc.tcp://127.0.0.1:4841",
+        },
+    },
     "database": {
         "enable": False,
         "host": "127.0.0.1",

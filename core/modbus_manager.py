@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any
 
 from .data_model import PointValue, make_modbus_point_key
+from .gateway_security import ReadonlyGatewayPolicy
 
 PROTOCOL_MODBUS = "MODBUS_RTU"
 
@@ -28,6 +29,7 @@ class ModbusRtuManager:
         self.config_manager = config_manager
         self.value_bus = value_bus
         self.log_func = log_func
+        self._readonly_policy = ReadonlyGatewayPolicy(self._log)
         self._state_lock = threading.RLock()
         self._io_lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -386,114 +388,25 @@ class ModbusRtuManager:
         with self._state_lock:
             return bool(self._thread and self._thread.is_alive())
 
-    @classmethod
-    def _encode_registers(cls, value_text: Any, data_type: str, count: int) -> list[int]:
-        normalized = str(data_type or "UInt16").upper().replace("-", "_")
-        base = normalized.split("_", 1)[0]
-        if base in {"AUTO", "UINT16"}:
-            registers = [int(str(value_text).strip(), 0)]
-        elif base == "INT16":
-            registers = list(struct.unpack(">H", struct.pack(">h", int(value_text))))
-        elif base in {"BOOL", "BOOLEAN"}:
-            registers = [1 if cls._parse_bool(value_text) else 0]
-        else:
-            formats = {
-                "UINT32": ">I",
-                "INT32": ">i",
-                "FLOAT32": ">f",
-                "UINT64": ">Q",
-                "INT64": ">q",
-                "FLOAT64": ">d",
-                "DOUBLE": ">d",
-            }
-            if base == "STRING":
-                raw = str(value_text).encode("utf-8")[: count * 2].ljust(count * 2, b"\x00")
-            elif base in formats:
-                converter = float if base in {"FLOAT32", "FLOAT64", "DOUBLE"} else int
-                raw = struct.pack(formats[base], converter(value_text))
-            else:
-                raise ValueError(f"不支援的Modbus寫入data_type：{data_type}")
-            suffix = normalized.rsplit("_", 1)[-1]
-            if suffix in {"CDAB", "DCBA"} and len(raw) >= 4:
-                words = [raw[index : index + 2] for index in range(0, len(raw), 2)]
-                raw = b"".join(reversed(words))
-            if suffix in {"BADC", "DCBA"}:
-                raw = b"".join(raw[index : index + 2][::-1] for index in range(0, len(raw), 2))
-            registers = [
-                struct.unpack(">H", raw[index : index + 2])[0]
-                for index in range(0, len(raw), 2)
-            ]
-
-        if len(registers) > count:
-            raise ValueError(f"寫入值需要{len(registers)}個Register，但設定count只有{count}")
-        return registers + [0] * max(0, count - len(registers))
-
-    @staticmethod
-    def _parse_bool(value_text: Any) -> bool:
-        if isinstance(value_text, bool):
-            return value_text
-        text = str(value_text).strip().lower()
-        if text in {"1", "true", "yes", "y", "on", "是"}:
-            return True
-        if text in {"0", "false", "no", "n", "off", "否"}:
-            return False
-        return bool(int(text, 0))
-
-    def _write_registers_unlocked(
-        self,
-        client,
-        station: int,
-        address: int,
-        registers: list[int],
-    ):
-        if len(registers) == 1:
-            method = getattr(client, "write_register")
-            return self._call_unit(method, station, address=address, value=registers[0])
-        method = getattr(client, "write_registers")
-        return self._call_unit(method, station, address=address, values=registers)
-
-    def _write_coil_unlocked(self, client, station: int, address: int, value: bool):
-        method = getattr(client, "write_coil")
-        return self._call_unit(method, station, address=address, value=value)
-
     def write_point(self, point_key, value_text):
+        self._reject_write_point(point_key, value_text, PROTOCOL_MODBUS)
+
+    def _reject_write_point(self, point_key, value_text, protocol):
+        """相容舊公開入口，但在任何 Transport I/O 前固定拒絕。"""
         with self._state_lock:
             item = self._points.get(str(point_key))
-        if item is None:
-            raise KeyError(f"找不到Modbus點位：{point_key}")
-
-        device, point = item
-        if not self._as_bool(point.get("writable", False), False):
-            raise PermissionError(f"Modbus點位不可寫入：{point.get('name', point_key)}")
-
-        point_type = str(point.get("type", "holding_register")).lower()
-        if point_type not in {"holding_register", "coil"}:
-            raise ValueError(f"{point_type}不支援寫入，僅holding_register與coil可寫入")
-
-        station = int(device.get("station_id", 1))
-        address = int(point.get("address", 0))
-        count = max(1, int(point.get("count", 1)))
-
-        with self._io_lock:
-            client = self._ensure_client_unlocked()
-            if point_type == "coil":
-                response = self._write_coil_unlocked(
-                    client,
-                    station,
-                    address,
-                    self._parse_bool(value_text),
-                )
-            else:
-                registers = self._encode_registers(
-                    value_text,
-                    str(point.get("data_type", "UInt16")),
-                    count,
-                )
-                response = self._write_registers_unlocked(client, station, address, registers)
-            self._response_error(response)
-
-            raw = self._read_raw_unlocked(client, device, point)
-
-        value = self._decode(raw, str(point.get("data_type", "Auto")), point_type)
-        self._publish(device, point, value, "WriteGood")
-        return True
+        device, point = item if item is not None else ({}, {})
+        self._readonly_policy.reject_write(
+            protocol=protocol,
+            client="local-api",
+            target=(
+                f"{device.get('name', 'unknown')}/"
+                f"{point.get('name', point_key)}"
+            ),
+            address=(
+                f"{point.get('type', 'unknown')}:"
+                f"{point.get('address', 'unknown')}"
+            ),
+            request_type="write_point",
+            requested_value=value_text,
+        )

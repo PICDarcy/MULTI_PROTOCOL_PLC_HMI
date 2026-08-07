@@ -266,63 +266,7 @@ class ModbusTcpManager(ModbusRtuManager):
         return {"success": success, "failed": failed, "total": success + failed}
 
     def write_point(self, point_key, value_text):
-        try:
-            with self._io_lock:
-                with self._state_lock:
-                    item = self._points.get(str(point_key))
-                if item is None:
-                    raise KeyError(f"找不到Modbus TCP點位：{point_key}")
-
-                device, point = item
-                if not self._as_bool(point.get("writable", False), False):
-                    raise PermissionError(
-                        f"Modbus TCP點位不可寫入："
-                        f"{point.get('name', point_key)}"
-                    )
-
-                point_type = str(
-                    point.get("type", "holding_register")
-                ).lower()
-                if point_type not in {"holding_register", "coil"}:
-                    raise ValueError(
-                        f"{point_type}不支援寫入，"
-                        "僅holding_register與coil可寫入"
-                    )
-
-                station = int(device.get("station_id", 1))
-                address = int(point.get("address", 0))
-                count = max(1, int(point.get("count", 1)))
-                client = self._ensure_client_unlocked(device)
-                if point_type == "coil":
-                    response = self._write_coil_unlocked(
-                        client,
-                        station,
-                        address,
-                        self._parse_bool(value_text),
-                    )
-                else:
-                    registers = self._encode_registers(
-                        value_text,
-                        str(point.get("data_type", "UInt16")),
-                        count,
-                    )
-                    response = self._write_registers_unlocked(
-                        client, station, address, registers
-                    )
-                self._response_error(response)
-                raw = self._read_raw_unlocked(client, device, point)
-        except Exception:
-            if "device" in locals():
-                self._discard_client(device)
-            raise
-
-        value = self._decode(
-            raw,
-            str(point.get("data_type", "Auto")),
-            point_type,
-        )
-        self._publish(device, point, value, "WriteGood")
-        return True
+        self._reject_write_point(point_key, value_text, PROTOCOL_MODBUS_TCP)
 
     def start_polling(self):
         with self._state_lock:

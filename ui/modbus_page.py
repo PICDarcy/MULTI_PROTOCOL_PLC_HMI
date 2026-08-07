@@ -205,7 +205,6 @@ class ModbusPage(ttk.Frame):
             "address",
             "count",
             "data_type",
-            "writable",
             "db_enable",
         )
         self.point_tree = ttk.Treeview(
@@ -221,7 +220,6 @@ class ModbusPage(ttk.Frame):
             "address": "位址",
             "count": "數量",
             "data_type": "資料型別",
-            "writable": "可寫入",
             "db_enable": "寫入資料庫",
         }
         widths = {
@@ -231,7 +229,6 @@ class ModbusPage(ttk.Frame):
             "address": 65,
             "count": 60,
             "data_type": 90,
-            "writable": 70,
             "db_enable": 90,
         }
         for column in point_columns:
@@ -701,7 +698,6 @@ class ModbusPage(ttk.Frame):
                     point["address"],
                     point["count"],
                     point["data_type"],
-                    self._yes_no(point["writable"]),
                     self._yes_no(point["db_enable"]),
                 ),
             )
@@ -983,7 +979,6 @@ class _PointDialog(_ModalDialog):
         self.address_var = tk.StringVar(value=str(source.get("address", 0)))
         self.count_var = tk.StringVar(value=str(source.get("count", 1)))
         self.data_type_var = tk.StringVar(value=str(source.get("data_type", "uint16")))
-        self.writable_var = tk.BooleanVar(value=bool(source.get("writable", False)))
         self.db_enable_var = tk.BooleanVar(value=bool(source.get("db_enable", False)))
 
         frame = ttk.Frame(self, padding=14)
@@ -1007,14 +1002,10 @@ class _PointDialog(_ModalDialog):
         for row, (label, widget) in enumerate(fields, start=1):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="e", padx=(0, 8), pady=4)
             widget.grid(row=row, column=1, sticky="w", pady=4)
-        fields[1][1].bind("<<ComboboxSelected>>", lambda _event: self._update_writable())
-
         options = ttk.Frame(frame)
         options.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 2))
-        self.writable_check = ttk.Checkbutton(options, text="允許寫入", variable=self.writable_var)
-        self.writable_check.pack(side=tk.LEFT, padx=(0, 14))
         ttk.Checkbutton(options, text="寫入資料庫", variable=self.db_enable_var).pack(side=tk.LEFT)
-        ttk.Label(frame, text="input_register與discrete_input為唯讀類型。 ").grid(
+        ttk.Label(frame, text="第一版 Gateway 的所有來源點位皆為唯讀。 ").grid(
             row=7, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
         buttons = ttk.Frame(frame)
@@ -1022,16 +1013,8 @@ class _PointDialog(_ModalDialog):
         ttk.Button(buttons, text="確定", command=self._ok).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(buttons, text="取消", command=self._cancel).pack(side=tk.LEFT)
         fields[0][1].focus_set()
-        self._update_writable()
         self.bind("<Return>", lambda _event: self._ok())
         self.bind("<Escape>", lambda _event: self._cancel())
-
-    def _update_writable(self) -> None:
-        if self.type_var.get() in READ_ONLY_TYPES:
-            self.writable_var.set(False)
-            self.writable_check.state(["disabled"])
-        else:
-            self.writable_check.state(["!disabled"])
 
     def _ok(self) -> None:
         name = self.name_var.get().strip()
@@ -1064,7 +1047,7 @@ class _PointDialog(_ModalDialog):
                 "address": address,
                 "count": count,
                 "data_type": data_type,
-                "writable": False if point_type in READ_ONLY_TYPES else bool(self.writable_var.get()),
+                "writable": False,
                 "db_enable": bool(self.db_enable_var.get()),
             }
         )

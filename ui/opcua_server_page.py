@@ -237,9 +237,9 @@ class OpcuaServerPage(ttk.Frame):
         ):
             ttk.Button(buttons, text=text, command=command).pack(side="left", padx=(0, 6), pady=2)
 
-        columns = ("enable", "name", "node_id", "subscribe", "writable", "data_type", "db_enable", "status")
-        headings = ("啟用", "名稱", "Node ID", "訂閱", "可寫入", "資料型別", "寫入DB", "訂閱狀態")
-        widths = (60, 150, 320, 65, 70, 100, 70, 100)
+        columns = ("enable", "name", "node_id", "subscribe", "data_type", "db_enable", "status")
+        headings = ("啟用", "名稱", "Node ID", "訂閱", "資料型別", "寫入DB", "訂閱狀態")
+        widths = (60, 150, 320, 65, 100, 70, 100)
         self.node_tree = self._make_tree(parent, columns, headings, widths, row=1)
         self.node_tree.column("name", anchor="w")
         self.node_tree.column("node_id", anchor="w")
@@ -369,8 +369,9 @@ class OpcuaServerPage(ttk.Frame):
             node.get("enable", node.get("enabled")),
             NODE_DEFAULTS["enable"],
         )
-        for key in ("subscribe", "writable", "db_enable"):
+        for key in ("subscribe", "db_enable"):
             node[key] = _bool(node.get(key), NODE_DEFAULTS[key])
+        node["writable"] = False
         node["name"] = str(node.get("name", "")).strip()
         node["node_id"] = str(node.get("node_id", "")).strip()
         node["data_type"] = str(node.get("data_type", "Auto")).strip() or "Auto"
@@ -406,7 +407,7 @@ class OpcuaServerPage(ttk.Frame):
         for index, node in enumerate(server["nodes"]):
             self.node_tree.insert("", "end", iid=f"n{index}", values=(
                 self._yn(node["enable"]), node["name"], node["node_id"],
-                self._yn(node["subscribe"]), self._yn(node["writable"]), node["data_type"],
+                self._yn(node["subscribe"]), node["data_type"],
                 self._yn(node["db_enable"]), self._node_status.get((server["name"], node["node_id"]), "未訂閱"),
             ))
         if server["nodes"]:
@@ -452,7 +453,6 @@ class OpcuaServerPage(ttk.Frame):
             {"key": "name", "label": "Node名稱"},
             {"key": "node_id", "label": "Node ID"},
             {"key": "subscribe", "label": "啟用訂閱", "type": "bool"},
-            {"key": "writable", "label": "允許寫入", "type": "bool"},
             {"key": "data_type", "label": "資料型別", "type": "combo", "values": DATA_TYPES},
             {"key": "db_enable", "label": "寫入資料庫", "type": "bool"},
         ]

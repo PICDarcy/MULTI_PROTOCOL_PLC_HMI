@@ -1,23 +1,19 @@
-"""統一監控與點位讀寫頁面。"""
+"""第一版 Gateway 的統一唯讀監控頁面。"""
 
 from __future__ import annotations
 
-import concurrent.futures
 import threading
 import tkinter as tk
 from collections.abc import Mapping
 from datetime import datetime
-from tkinter import messagebox, ttk
+from tkinter import ttk
 from typing import Any
 
 
 class MonitorPage(ttk.Frame):
-    """顯示ValueBus中的所有最新PointValue並提供統一寫入功能。
+    """以第一版 Gateway 唯讀介面顯示所有最新 PointValue。
 
-    修正重點：
-    - OPC UA寫入若回傳concurrent.futures.Future，必須在背景執行緒等待完成。
-    - 只有Future完成且未丟出例外時才顯示成功。
-    - 所有Tkinter訊息框都回到主執行緒顯示，避免背景執行緒操作UI。
+    監控頁不建立寫入欄位、按鈕或背景寫入執行緒。
     """
 
     COLUMNS = (
@@ -27,7 +23,6 @@ class MonitorPage(ttk.Frame):
         "point_name",
         "address_text",
         "data_type",
-        "writable",
         "value_text",
         "status_text",
         "timestamp",
@@ -40,7 +35,6 @@ class MonitorPage(ttk.Frame):
         "point_name": "點位名稱",
         "address_text": "位址／NodeId",
         "data_type": "資料型別",
-        "writable": "可寫入",
         "value_text": "目前值",
         "status_text": "狀態",
         "timestamp": "更新時間",
@@ -51,9 +45,6 @@ class MonitorPage(ttk.Frame):
 
         self.app_context = app_context
         self.value_bus = self._get_context_value("value_bus")
-        self.modbus_manager = self._get_context_value("modbus_manager")
-        self.modbus_tcp_manager = self._get_context_value("modbus_tcp_manager")
-        self.opcua_manager = self._get_context_value("opcua_manager")
         self.log_func = self._get_context_value("log_func", lambda message: None)
 
         self._destroyed = False
@@ -66,13 +57,9 @@ class MonitorPage(ttk.Frame):
         self._pending_lock = threading.Lock()
         self._pending_points: dict[str, Any] = {}
         self._after_id: str | None = None
-        self._write_lock = threading.Lock()
-        self._write_worker: threading.Thread | None = None
-
         self.selected_point_var = tk.StringVar(value="尚未選取點位")
         self.selected_address_var = tk.StringVar(value="-")
         self.selected_value_var = tk.StringVar(value="-")
-        self.write_value_var = tk.StringVar()
 
         self._build_ui()
         self._subscribe_value_bus()
@@ -94,7 +81,7 @@ class MonitorPage(ttk.Frame):
 
         ttk.Label(
             title_frame,
-            text="統一監控／讀寫",
+            text="統一監控（第一版唯讀 Gateway）",
             font=("", 14, "bold"),
         ).grid(row=0, column=0, sticky="w")
 
@@ -123,7 +110,6 @@ class MonitorPage(ttk.Frame):
             "point_name": 150,
             "address_text": 230,
             "data_type": 100,
-            "writable": 75,
             "value_text": 140,
             "status_text": 120,
             "timestamp": 165,
@@ -135,7 +121,7 @@ class MonitorPage(ttk.Frame):
                 column,
                 width=widths[column],
                 minwidth=60,
-                anchor="center" if column in {"protocol", "data_type", "writable"} else "w",
+                anchor="center" if column in {"protocol", "data_type"} else "w",
             )
 
         y_scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
@@ -150,7 +136,7 @@ class MonitorPage(ttk.Frame):
         self.tree.bind("<Double-1>", self._on_tree_double_click)
         self.tree.bind("<Button-3>", self._show_context_menu)
 
-        detail_frame = ttk.LabelFrame(self, text="點位讀寫", padding=10)
+        detail_frame = ttk.LabelFrame(self, text="點位詳細資料", padding=10)
         detail_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 8))
         detail_frame.columnconfigure(1, weight=1)
         detail_frame.columnconfigure(3, weight=1)
@@ -164,24 +150,12 @@ class MonitorPage(ttk.Frame):
         ttk.Label(detail_frame, text="目前值：").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Label(detail_frame, textvariable=self.selected_value_var).grid(row=1, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(detail_frame, text="寫入值：").grid(row=1, column=2, sticky="w", padx=(16, 0), pady=(6, 0))
-        self.write_entry = ttk.Entry(detail_frame, textvariable=self.write_value_var)
-        self.write_entry.grid(row=1, column=3, sticky="ew", pady=(6, 0))
-        self.write_entry.bind("<Return>", lambda _event: self.write_selected_point())
-
-        button_frame = ttk.Frame(detail_frame)
-        button_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
-
-        self.write_button = ttk.Button(button_frame, text="寫入新值", command=self.write_selected_point)
-        self.write_button.pack(side="left")
-        ttk.Button(button_frame, text="寫入TRUE", command=lambda: self._quick_write("TRUE")).pack(side="left", padx=(6, 0))
-        ttk.Button(button_frame, text="寫入FALSE", command=lambda: self._quick_write("FALSE")).pack(side="left", padx=(6, 0))
-        ttk.Button(button_frame, text="填入目前值", command=self.fill_current_value).pack(side="left", padx=(6, 0))
-        ttk.Button(button_frame, text="重新整理", command=self.refresh_table).pack(side="left", padx=(6, 0))
+        ttk.Label(
+            detail_frame,
+            text="第一版 Gateway 不提供任何設備或輸出端寫入操作。",
+        ).grid(row=1, column=2, columnspan=2, sticky="w", padx=(16, 0), pady=(6, 0))
 
         self.context_menu = tk.Menu(self, tearoff=False)
-        self.context_menu.add_command(label="寫入此點位", command=self.write_selected_point)
-        self.context_menu.add_separator()
         self.context_menu.add_command(label="複製point_key", command=self._copy_point_key)
         self.context_menu.add_command(label="複製位址／NodeId", command=self._copy_address)
         self.context_menu.add_separator()
@@ -335,7 +309,6 @@ class MonitorPage(ttk.Frame):
             self._text(self._field(point_value, "point_name")),
             self._text(self._field(point_value, "address_text")),
             self._text(self._field(point_value, "data_type")),
-            "是" if self._as_bool(self._field(point_value, "writable", False)) else "否",
             self._text(self._field(point_value, "value_text", self._field(point_value, "value"))),
             self._text(self._field(point_value, "status_text")),
             self._format_timestamp(self._field(point_value, "timestamp")),
@@ -355,7 +328,7 @@ class MonitorPage(ttk.Frame):
         self.tree.selection_set(iid)
         self.tree.focus(iid)
         self._on_tree_select()
-        self.fill_current_value()
+        self._show_point_details(self._selected_point())
 
     def _show_context_menu(self, event: tk.Event) -> None:
         iid = self.tree.identify_row(event.y)
@@ -396,172 +369,6 @@ class MonitorPage(ttk.Frame):
         self.selected_address_var.set("-")
         self.selected_value_var.set("-")
 
-    def fill_current_value(self) -> None:
-        point_value = self._selected_point()
-        if point_value is None:
-            return
-        value = self._field(point_value, "value_text", self._field(point_value, "value"))
-        self.write_value_var.set(self._text(value))
-
-    def _quick_write(self, value_text: str) -> None:
-        self.write_value_var.set(value_text)
-        self.write_selected_point()
-
-    def write_selected_point(self) -> None:
-        point_value = self._selected_point()
-        if point_value is None:
-            messagebox.showwarning("尚未選取", "請先選取要寫入的點位。", parent=self)
-            return
-
-        if not self._as_bool(self._field(point_value, "writable", False)):
-            messagebox.showwarning("不可寫入", "此點位設定為不可寫入。", parent=self)
-            return
-
-        value_text = self.write_value_var.get().strip()
-        if value_text == "":
-            messagebox.showwarning("缺少寫入值", "請輸入要寫入的值。", parent=self)
-            return
-
-        protocol = self._text(self._field(point_value, "protocol")).upper()
-        point_name = self._text(self._field(point_value, "point_name")) or "未命名點位"
-        address_text = self._text(self._field(point_value, "address_text")) or "-"
-
-        confirm_text = (
-            "確定要寫入此點位嗎？\n\n"
-            f"協定：{protocol}\n"
-            f"點位：{point_name}\n"
-            f"位址／NodeId：{address_text}\n"
-            f"新值：{value_text}"
-        )
-        if not messagebox.askyesno("確認寫入", confirm_text, parent=self):
-            return
-
-        if protocol == "OPCUA":
-            self._start_background_write(point_value, value_text, point_name)
-            return
-
-        try:
-            if protocol in {"MODBUS_RTU", "MODBUS_TCP"}:
-                result = self._write_modbus(point_value, value_text, protocol)
-            else:
-                raise ValueError(f"不支援的協定：{protocol or '未指定'}")
-        except Exception as exc:
-            self._log(f"點位寫入失敗：{exc}")
-            messagebox.showerror("寫入失敗", str(exc), parent=self)
-            return
-
-        if result is False:
-            messagebox.showerror("寫入失敗", "通訊管理器回報寫入失敗，請查看系統紀錄。", parent=self)
-            return
-
-        self._log(f"寫入成功：{point_name} = {value_text}")
-        messagebox.showinfo("寫入完成", "寫入成功。", parent=self)
-
-    def _start_background_write(self, point_value: Any, value_text: str, point_name: str) -> None:
-        with self._write_lock:
-            if self._write_worker and self._write_worker.is_alive():
-                messagebox.showwarning("寫入中", "已有一筆OPC UA寫入尚未完成，請稍後再試。", parent=self)
-                return
-            self._set_write_busy(True)
-            self._write_worker = threading.Thread(
-                target=self._opcua_write_worker,
-                args=(point_value, value_text, point_name),
-                name="MonitorOpcuaWrite",
-                daemon=True,
-            )
-            self._write_worker.start()
-
-    def _opcua_write_worker(self, point_value: Any, value_text: str, point_name: str) -> None:
-        error_text = ""
-        success = False
-        try:
-            result = self._write_opcua(point_value, value_text)
-            result = self._resolve_write_result(result, timeout=20.0)
-            if result is False:
-                raise RuntimeError("通訊管理器回報寫入失敗。")
-            success = True
-        except concurrent.futures.TimeoutError:
-            error_text = "OPC UA寫入等待逾時，請確認Server連線與Node權限。"
-        except Exception as exc:
-            error_text = str(exc) or exc.__class__.__name__
-
-        def finish() -> None:
-            if self._destroyed:
-                return
-            self._set_write_busy(False)
-            if success:
-                self._log(f"OPC UA寫入成功：{point_name} = {value_text}")
-                messagebox.showinfo("寫入完成", "OPC UA寫入已完成。", parent=self)
-            else:
-                self._log(f"OPC UA寫入失敗：{point_name} = {value_text}；{error_text}")
-                messagebox.showerror("寫入失敗", error_text, parent=self)
-
-        self._call_in_ui(finish)
-
-    def _resolve_write_result(self, result: Any, timeout: float) -> Any:
-        if isinstance(result, concurrent.futures.Future):
-            return result.result(timeout=timeout)
-        return result
-
-    def _set_write_busy(self, busy: bool) -> None:
-        state = "disabled" if busy else "normal"
-        try:
-            self.write_button.configure(state=state)
-        except Exception:
-            pass
-
-    def _write_modbus(
-        self, point_value: Any, value_text: str, protocol: str = "MODBUS_RTU"
-    ) -> Any:
-        manager = (
-            self.modbus_tcp_manager
-            if protocol == "MODBUS_TCP"
-            else self.modbus_manager
-        )
-        if manager is None:
-            raise RuntimeError(f"{protocol}管理器尚未建立。")
-        write_point = getattr(manager, "write_point", None)
-        if not callable(write_point):
-            raise RuntimeError(f"{protocol}管理器未提供write_point()。")
-        point_key = self._point_key(point_value)
-        if not point_key:
-            raise ValueError(f"此{protocol}點位缺少point_key。")
-        return write_point(point_key, value_text)
-
-    def _write_opcua(self, point_value: Any, value_text: str) -> Any:
-        if self.opcua_manager is None:
-            raise RuntimeError("opcua_manager尚未建立。")
-        write_node = getattr(self.opcua_manager, "write_node", None)
-        if not callable(write_node):
-            raise RuntimeError("opcua_manager未提供write_node()。")
-
-        raw_config = self._field(point_value, "raw_config", {})
-        if not isinstance(raw_config, Mapping):
-            raw_config = {}
-
-        server_name = self._first_nonempty(
-            raw_config.get("server_name"),
-            self._field(point_value, "source_name"),
-            self._field(point_value, "device_name"),
-        )
-        node_id = self._first_nonempty(
-            raw_config.get("node_id"),
-            raw_config.get("nodeId"),
-            self._field(point_value, "address_text"),
-        )
-        data_type = self._first_nonempty(
-            self._field(point_value, "data_type"),
-            raw_config.get("data_type"),
-            "Auto",
-        )
-
-        if not server_name:
-            raise ValueError("此OPCUA點位缺少server_name。")
-        if not node_id:
-            raise ValueError("此OPCUA點位缺少NodeId。")
-
-        return write_node(str(server_name), str(node_id), value_text, str(data_type))
-
     def _copy_point_key(self) -> None:
         point_value = self._selected_point()
         if point_value is not None:
@@ -596,24 +403,6 @@ class MonitorPage(ttk.Frame):
         return str(value)
 
     @staticmethod
-    def _as_bool(value: Any) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "y", "on", "是"}
-        return bool(value)
-
-    @staticmethod
-    def _first_nonempty(*values: Any) -> Any:
-        for value in values:
-            if value is None:
-                continue
-            if isinstance(value, str) and value.strip() == "":
-                continue
-            return value
-        return None
-
-    @staticmethod
     def _format_timestamp(value: Any) -> str:
         if isinstance(value, datetime):
             return value.strftime("%Y-%m-%d %H:%M:%S")
@@ -627,14 +416,6 @@ class MonitorPage(ttk.Frame):
         except TypeError:
             self.log_func(message, "INFO")
         except Exception:
-            pass
-
-    def _call_in_ui(self, callback) -> None:
-        if self._destroyed:
-            return
-        try:
-            self.after(0, callback)
-        except (tk.TclError, RuntimeError):
             pass
 
     def destroy(self) -> None:
