@@ -85,7 +85,7 @@ OPC UA Manager ─────┘                         └─> DatabaseManage
 
 1.執行`main.py`。
 2.建立Tkinter主視窗。
-3.讀取`config.json`。
+3.讀取本機`config.json`並驗證已啟用功能的必要憑證。
 4.建立`ConfigManager`與`ValueBus`。
 5.建立Modbus RTU、Modbus TCP、OPC UA與DatabaseManager。
 6.建立各個HMI頁面，並透過`app_context`共用Manager。
@@ -128,7 +128,8 @@ Tkinter畫面必須由主執行緒操作，因此通訊及資料庫工作不直�
 ```text
 MULTI_PROTOCOL_PLC_HMI/
 ├─ main.py
-├─ config.json
+├─ config.example.json
+├─ config.json（本機建立，Git不追蹤）
 ├─ requirements.txt
 ├─ README.md
 ├─ README_RUN.md
@@ -164,7 +165,8 @@ MULTI_PROTOCOL_PLC_HMI/
 | 檔案 | 功能 |
 |---|---|
 | `main.py` | 專案入口，建立並啟動Tkinter應用程式。 |
-| `config.json` | 集中保存資料庫、Modbus RTU、Modbus TCP、OPC UA設備與點位設定。 |
+| `config.example.json` | 可公開、可複製的安全設定範例，不含可用憑證。 |
+| `config.json` | 本機私密設定，集中保存現場設備、點位與資料庫憑證；Git不追蹤。 |
 | `requirements.txt` | Python套件與版本需求。 |
 | `README_RUN.md` | 執行環境、安裝與常見問題的補充說明。 |
 
@@ -301,7 +303,17 @@ OPC UA使用NodeId識別資料，而不是使用固定的D暫存器或M點位位
 
 ## 8.config.json設定
 
-專案使用`config.json`集中管理所有通訊與資料庫設定。
+專案使用本機`config.json`集中管理所有通訊與資料庫設定。首次執行前先在
+PowerShell執行：
+
+```powershell
+Copy-Item .\config.example.json .\config.json
+```
+
+請勿在`config.example.json`填入密碼、Token、API Key或私鑰。可執行
+`python scripts/check_example_credentials.py`進行靜態檢查。程式啟動時也會
+驗證已啟用資料庫及OPC UA帳密登入所需的憑證；缺漏時只回報欄位路徑，
+不輸出敏感值。
 
 主要區段：
 
