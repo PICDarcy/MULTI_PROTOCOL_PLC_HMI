@@ -92,6 +92,7 @@ class OpcuaMultiServerManager:
         self._node_configs: dict[str, dict[str, dict[str, Any]]] = {}
         self._connected: dict[str, bool] = {}
         self._operation_locks: dict[str, asyncio.Lock] = {}
+        self._poll_tasks: dict[tuple[str, str], asyncio.Task] = {}
 
         self.latest_values: dict[str, PointValue] = {}
         self.latest_status: dict[str, dict[str, Any]] = {}
@@ -375,6 +376,7 @@ class OpcuaMultiServerManager:
 
     async def _disconnect_server(self, server_name: str) -> dict[str, Any]:
         async with self._server_lock(server_name):
+            await self._cancel_poll_tasks(server_name)
             subscription = self._subscriptions.pop(server_name, None)
             client = self._clients.pop(server_name, None)
             self._handlers.pop(server_name, None)
@@ -555,6 +557,8 @@ class OpcuaMultiServerManager:
                     self._now(),
                 )
 
+            await self._cancel_poll_task(server_name, node_id)
+
         try:
             data_value = await node.read_data_value()
             await self._publish_data_value(
@@ -584,17 +588,18 @@ class OpcuaMultiServerManager:
     ) -> dict[str, Any]:
         node_id = self._canonical_node_id(node_id)
         async with self._server_lock(server_name):
+            had_poll = await self._cancel_poll_task(server_name, node_id)
             subscription = self._subscriptions.get(server_name)
             handle = self._handles.get(server_name, {}).pop(node_id, None)
             self._node_configs.get(server_name, {}).pop(node_id, None)
-            if handle is None:
+            if handle is None and not had_poll:
                 return {
                     "server_name": server_name,
                     "node_id": node_id,
                     "subscribed": False,
                     "already_unsubscribed": True,
                 }
-            if subscription is not None:
+            if subscription is not None and handle is not None:
                 await subscription.unsubscribe(handle)
             self._set_point_status(
                 server_name,
@@ -609,6 +614,26 @@ class OpcuaMultiServerManager:
                 "subscribed": False,
                 "already_unsubscribed": False,
             }
+
+    async def _cancel_poll_task(self, server_name: str, node_id: str) -> bool:
+        task = self._poll_tasks.pop((server_name, node_id), None)
+        if task is None:
+            return False
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return True
+
+    async def _cancel_poll_tasks(self, server_name: str) -> int:
+        tasks = [
+            self._poll_tasks.pop(key)
+            for key in tuple(self._poll_tasks)
+            if key[0] == server_name
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return len(tasks)
 
     async def _subscribe_all(self) -> dict[str, Any]:
         await self._connect_all()
@@ -631,7 +656,12 @@ class OpcuaMultiServerManager:
                         node_config.get("subscribe", True),
                         True,
                     )
-                    if not enabled or not subscribe:
+                    if not enabled:
+                        continue
+                    if not subscribe:
+                        results.append(
+                            self._start_polling_node(server_name, node_config)
+                        )
                         continue
                 try:
                     results.append(
@@ -646,19 +676,67 @@ class OpcuaMultiServerManager:
                         if isinstance(node_config, Mapping)
                         else str(node_config)
                     )
-                    results.append(
-                        {
-                            "server_name": server_name,
-                            "node_id": node_id,
-                            "subscribed": False,
-                            "error": str(exc),
-                        }
+                    self._log(
+                        f"Server「{server_name}」Node「{node_id}」"
+                        f"Subscription不可用，改用輪詢：{exc}",
+                        "WARNING",
                     )
+                    fallback = self._start_polling_node(
+                        server_name,
+                        node_config,
+                    )
+                    fallback["subscription_error"] = str(exc)
+                    results.append(fallback)
             output[server_name] = {
                 "server_name": server_name,
                 "nodes": results,
             }
         return output
+
+    def _start_polling_node(
+        self,
+        server_name: str,
+        node_config: Any,
+    ) -> dict[str, Any]:
+        config = self._normalize_node_config(server_name, node_config)
+        node_id = config["node_id"]
+        key = (server_name, node_id)
+        task = self._poll_tasks.get(key)
+        if task is None or task.done():
+            self._node_configs.setdefault(server_name, {})[node_id] = config
+            self._poll_tasks[key] = asyncio.create_task(
+                self._poll_node_loop(server_name, node_id),
+                name=f"OpcuaPoll:{server_name}:{node_id}",
+            )
+        return {
+            "server_name": server_name,
+            "node_id": node_id,
+            "subscribed": False,
+            "mode": "poll",
+        }
+
+    async def _poll_node_loop(self, server_name: str, node_id: str) -> None:
+        server_config = self._require_server_config(server_name)
+        node_config = self._configured_node_config(server_name, node_id)
+        interval = self._to_float(
+            node_config.get(
+                "poll_interval",
+                server_config.get("poll_interval", 1.0),
+            ),
+            1.0,
+            minimum=0.01,
+        )
+        while not self._closed:
+            try:
+                await self._read_node(server_name, node_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log(
+                    f"Server「{server_name}」Node「{node_id}」輪詢失敗：{exc}",
+                    "WARNING",
+                )
+            await asyncio.sleep(interval)
 
     async def _on_datachange(self, server_name: str, node, value, data):
         try:
@@ -853,6 +931,7 @@ class OpcuaMultiServerManager:
             self._node_configs.clear()
             self._connected = {name: False for name in new_configs}
             self._operation_locks.clear()
+            self._poll_tasks.clear()
             self.latest_status = {}
             for server_name in new_configs:
                 self._set_server_status(
@@ -880,25 +959,48 @@ class OpcuaMultiServerManager:
         data_value,
         config: Mapping[str, Any] | None = None,
     ) -> PointValue:
+        gateway_timestamp = self._now()
+        variant = getattr(data_value, "Value", None)
         value = getattr(
-            getattr(data_value, "Value", None),
+            variant,
             "Value",
             None,
         )
+        variant_type = getattr(variant, "VariantType", None)
+        data_type = getattr(variant_type, "name", None)
         status_code = getattr(data_value, "StatusCode", None)
-        status_text = (
-            str(status_code) if status_code is not None else "Unknown"
+        status_text, quality, status_value = self._status_contract(status_code)
+        raw_source_time = getattr(data_value, "SourceTimestamp", None)
+        raw_server_time = getattr(data_value, "ServerTimestamp", None)
+        source_time = (
+            raw_source_time
+            if self._valid_source_timestamp(raw_source_time)
+            else gateway_timestamp
         )
-        source_time = getattr(data_value, "SourceTimestamp", None)
-        server_time = getattr(data_value, "ServerTimestamp", None)
-        timestamp = source_time or server_time or self._now()
+        server_time = (
+            raw_server_time
+            if isinstance(raw_server_time, datetime)
+            else None
+        )
+        if self._timestamp_is_after(source_time, gateway_timestamp):
+            self._log(
+                f"Server「{server_name}」Node「{node_id}」"
+                f"來源時間超前Gateway時間：{source_time.isoformat()}",
+                "WARNING",
+            )
         return await self._publish_value(
             server_name,
             node_id,
             value,
             config=config,
             status_text=status_text,
-            timestamp=timestamp,
+            timestamp=source_time,
+            data_type=data_type,
+            quality=quality,
+            source_timestamp=source_time,
+            server_timestamp=server_time,
+            gateway_timestamp=gateway_timestamp,
+            status_code_value=status_value,
         )
 
     async def _publish_value(
@@ -909,22 +1011,47 @@ class OpcuaMultiServerManager:
         config: Mapping[str, Any] | None,
         status_text: str,
         timestamp: datetime,
+        data_type: str | None = None,
+        quality: str | None = None,
+        source_timestamp: datetime | None = None,
+        server_timestamp: datetime | None = None,
+        gateway_timestamp: datetime | None = None,
+        status_code_value: int | None = None,
     ) -> PointValue:
         node_id = self._canonical_node_id(node_id)
         normalized = self._normalize_node_config(
             server_name,
             config or {"node_id": node_id},
         )
-        data_type = str(normalized.get("data_type", "Auto") or "Auto")
-        if data_type.upper() == "AUTO":
-            data_type = (
+        configured_data_type = str(
+            normalized.get("data_type", "Auto") or "Auto"
+        )
+        if data_type:
+            resolved_data_type = str(data_type)
+        elif configured_data_type.upper() != "AUTO":
+            resolved_data_type = configured_data_type
+        else:
+            resolved_data_type = (
                 type(value).__name__
                 if value is not None
                 else "NoneType"
             )
 
+        gateway_time = gateway_timestamp or self._now()
+        source_time = source_timestamp or timestamp or gateway_time
+        raw_config = self._sanitize(normalized)
+        raw_config.update(
+            {
+                "opcua_status_code": status_text,
+                "opcua_status_value": status_code_value,
+                "opcua_server_timestamp": server_timestamp,
+                "gateway_timestamp": gateway_time,
+            }
+        )
+        point_key = make_opcua_point_key(server_name, node_id)
+
         point_value = PointValue(
-            point_key=make_opcua_point_key(server_name, node_id),
+            point_key=point_key,
             protocol=PROTOCOL_OPCUA,
             source_name=str(
                 normalized.get("source_name", server_name)
@@ -938,12 +1065,19 @@ class OpcuaMultiServerManager:
             value_text=self._value_text(value),
             value_number=self._value_number(value),
             status_text=status_text,
-            timestamp=timestamp,
+            timestamp=source_time,
             writable=self._to_bool(
                 normalized.get("writable", False)
             ),
-            data_type=data_type,
-            raw_config=self._sanitize(normalized),
+            data_type=resolved_data_type,
+            raw_config=raw_config,
+            tag_id=str(normalized.get("tag_id", point_key)),
+            connection_id=str(normalized["connection_id"]),
+            device_id=str(normalized["device_id"]),
+            quality=str(quality or status_text or "Unknown"),
+            source_timestamp=source_time,
+            server_timestamp=server_timestamp,
+            gateway_timestamp=gateway_time,
         )
 
         with self._state_lock:
@@ -957,6 +1091,45 @@ class OpcuaMultiServerManager:
         )
         self.value_bus.publish(point_value)
         return point_value
+
+    @staticmethod
+    def _status_contract(status_code) -> tuple[str, str, int | None]:
+        if status_code is None:
+            return "Unknown", "Unknown", None
+        status_text = str(getattr(status_code, "name", status_code))
+        try:
+            if status_code.is_good():
+                quality = "Good"
+            elif status_code.is_uncertain():
+                quality = "Uncertain"
+            elif status_code.is_bad():
+                quality = "Bad"
+            else:
+                quality = "Unknown"
+        except (AttributeError, TypeError):
+            quality = "Unknown"
+        value = getattr(status_code, "value", None)
+        return status_text, quality, int(value) if value is not None else None
+
+    @staticmethod
+    def _timestamp_is_after(left: datetime, right: datetime) -> bool:
+        def utc(value: datetime) -> datetime:
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+
+        return utc(left) > utc(right)
+
+    @staticmethod
+    def _valid_source_timestamp(value: Any) -> bool:
+        if not isinstance(value, datetime):
+            return False
+        if value.tzinfo is None:
+            comparable = value.replace(tzinfo=timezone.utc)
+        else:
+            comparable = value.astimezone(timezone.utc)
+        null_time = datetime(1601, 1, 1, tzinfo=timezone.utc)
+        return comparable > null_time
 
     def _point_to_dict(self, point_value: PointValue) -> dict[str, Any]:
         return point_value.to_dict()
@@ -1153,6 +1326,35 @@ class OpcuaMultiServerManager:
                 f"Server「{server_name}」的Node設定缺少node_id"
             )
         config["node_id"] = node_id
+        server_config = self._server_configs.get(server_name, {})
+        connection_id = str(
+            config.get(
+                "connection_id",
+                server_config.get(
+                    "connection_id",
+                    f"opcua-connection:{server_name}",
+                ),
+            )
+            or ""
+        ).strip()
+        device_id = str(
+            config.get(
+                "device_id",
+                server_config.get(
+                    "device_id",
+                    f"opcua-device:{server_name}",
+                ),
+            )
+            or ""
+        ).strip()
+        if not connection_id or not device_id:
+            raise ValueError("OPC UA canonical connection_id/device_id不可為空")
+        config["connection_id"] = connection_id
+        config["device_id"] = device_id
+        config.setdefault(
+            "tag_id",
+            make_opcua_point_key(server_name, node_id),
+        )
         config.setdefault(
             "enable",
             config.get("enabled", True),

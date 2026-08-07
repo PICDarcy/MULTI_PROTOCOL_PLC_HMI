@@ -149,6 +149,36 @@ class CanonicalModelTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             tag.metadata["engineering"]["unit"] = "F"
 
+    def test_new_gateway_timestamp_keeps_old_positional_constructor_order(self):
+        source_time = datetime(2026, 8, 8, tzinfo=timezone.utc)
+        server_time = datetime(2026, 8, 8, 0, 0, 1, tzinfo=timezone.utc)
+        modbus = ModbusTcpOutputMapping(enabled=True, address=100)
+        opcua = OpcuaOutputMapping(enabled=True, node_id="ns=2;s=legacy")
+
+        tag = CanonicalTag(
+            "tag-legacy",
+            "OPCUA::legacy::node",
+            "conn-line-a",
+            "device-boiler-1",
+            "Legacy",
+            "OPCUA",
+            "ns=2;s=legacy",
+            "Double",
+            "Good",
+            source_time,
+            server_time,
+            False,
+            modbus,
+            opcua,
+            {"legacy": True},
+        )
+
+        self.assertFalse(tag.enabled)
+        self.assertEqual(modbus, tag.modbus_tcp_output)
+        self.assertEqual(opcua, tag.opcua_output)
+        self.assertEqual({"legacy": True}, tag.metadata)
+        self.assertIsNone(tag.gateway_timestamp)
+
 
 if __name__ == "__main__":
     unittest.main()
