@@ -14,6 +14,7 @@ from core.config_manager import ConfigManager
 from core.gateway_modbus_server import GatewayModbusTcpServer
 from core.gateway_runtime import GatewayOutputRuntime
 from core.modbus_tcp_manager import ModbusTcpManager
+from core.opcua_manager import OpcuaMultiServerManager
 from core.value_bus import ValueBus
 
 class _OpcuaSourceRuntime:
@@ -24,6 +25,7 @@ class _OpcuaSourceRuntime:
         self.endpoint = f"opc.tcp://127.0.0.1:{self.port}"
         self.server = Server()
         self.node_id: ua.NodeId | None = None
+        self.node = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
@@ -83,10 +85,36 @@ class _OpcuaSourceRuntime:
             73.5,
             ua.VariantType.Double,
         )
+        self.node = node
         self.node_id = node.nodeid
         await self.server.start()
         self.port = int(self.server.bserver.port)
         self.endpoint = f"opc.tcp://127.0.0.1:{self.port}"
+
+    def set_data_value(
+        self,
+        value: Any,
+        *,
+        variant_type: ua.VariantType,
+        status_code: int,
+        source_timestamp,
+        server_timestamp,
+    ) -> None:
+        loop = self._loop
+        if loop is None or not loop.is_running() or self.node is None:
+            raise RuntimeError("模擬OPC UA來源尚未啟動")
+        future = asyncio.run_coroutine_threadsafe(
+            self.node.write_value(
+                ua.DataValue(
+                    Value=ua.Variant(value, variant_type),
+                    StatusCode_=ua.StatusCode(status_code),
+                    SourceTimestamp=source_timestamp,
+                    ServerTimestamp=server_timestamp,
+                )
+            ),
+            loop,
+        )
+        future.result(timeout=5)
 
 
 class LocalProtocolHarness:
@@ -99,6 +127,8 @@ class LocalProtocolHarness:
         opcua_source_port: int = 0,
         gateway_modbus_port: int = 0,
         gateway_opcua_port: int = 0,
+        opcua_subscribe: bool = True,
+        opcua_poll_interval: float = 0.1,
     ) -> None:
         self._requested_ports = {
             "modbus_source": int(modbus_source_port),
@@ -107,14 +137,18 @@ class LocalProtocolHarness:
             "gateway_opcua": int(gateway_opcua_port),
         }
         self._temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+        self._opcua_subscribe = bool(opcua_subscribe)
+        self._opcua_poll_interval = float(opcua_poll_interval)
         self._config_path: Path | None = None
         self.config_manager: ConfigManager | None = None
         self.value_bus: ValueBus | None = None
         self.modbus_manager: ModbusTcpManager | None = None
+        self.opcua_manager: OpcuaMultiServerManager | None = None
         self.gateway_runtime: GatewayOutputRuntime | None = None
         self.modbus_source: GatewayModbusTcpServer | None = None
         self.opcua_source: _OpcuaSourceRuntime | None = None
         self._allocated_ports: dict[str, int] = {}
+        self.logs: list[str] = []
         self._running = False
 
     def __enter__(self) -> "LocalProtocolHarness":
@@ -197,6 +231,11 @@ class LocalProtocolHarness:
                 self.config_manager,
                 self.value_bus,
             )
+            self.opcua_manager = OpcuaMultiServerManager(
+                self.config_manager,
+                self.value_bus,
+                self._capture_log,
+            )
             self.gateway_runtime = GatewayOutputRuntime(self.config_manager)
             self.gateway_runtime.start()
             if self.gateway_runtime.opcua_server is None:
@@ -223,6 +262,11 @@ class LocalProtocolHarness:
                 self.modbus_manager.stop_polling()
             except BaseException as exc:
                 errors.append(exc)
+        if self.opcua_manager is not None:
+            try:
+                self.opcua_manager.shutdown().result(timeout=10)
+            except BaseException as exc:
+                errors.append(exc)
         for component in (
             self.gateway_runtime,
             self.opcua_source,
@@ -237,6 +281,7 @@ class LocalProtocolHarness:
 
         self.gateway_runtime = None
         self.modbus_manager = None
+        self.opcua_manager = None
         self.opcua_source = None
         self.modbus_source = None
         self.value_bus = None
@@ -252,6 +297,47 @@ class LocalProtocolHarness:
         if self.modbus_manager is None:
             raise RuntimeError("測試環境尚未啟動")
         return self.modbus_manager.read_all_once()
+
+    def poll_opcua_source_once(self) -> dict[str, Any]:
+        if self.opcua_manager is None or self.opcua_source is None:
+            raise RuntimeError("測試環境尚未啟動")
+        return self.opcua_manager.read_node(
+            "Simulated OPC UA Source",
+            self.opcua_source.node_id.to_string(),
+        ).result(timeout=5)
+
+    def start_opcua_collection(self) -> dict[str, Any]:
+        if self.opcua_manager is None:
+            raise RuntimeError("測試環境尚未啟動")
+        result = self.opcua_manager.subscribe_all().result(timeout=5)
+        return result["Simulated OPC UA Source"]["nodes"][0]
+
+    def stop_opcua_collection(self) -> dict[str, Any]:
+        if self.opcua_manager is None or self.opcua_source is None:
+            raise RuntimeError("測試環境尚未啟動")
+        return self.opcua_manager.unsubscribe_node(
+            "Simulated OPC UA Source",
+            self.opcua_source.node_id.to_string(),
+        ).result(timeout=5)
+
+    def set_opcua_source_value(
+        self,
+        value: Any,
+        *,
+        variant_type: ua.VariantType = ua.VariantType.Double,
+        status_code: int = ua.StatusCodes.Good,
+        source_timestamp=None,
+        server_timestamp=None,
+    ) -> None:
+        if self.opcua_source is None:
+            raise RuntimeError("測試環境尚未啟動")
+        self.opcua_source.set_data_value(
+            value,
+            variant_type=variant_type,
+            status_code=status_code,
+            source_timestamp=source_timestamp,
+            server_timestamp=server_timestamp,
+        )
 
     async def read_opcua_source(self) -> Any:
         if self.opcua_source is None or self.opcua_source.node_id is None:
@@ -280,13 +366,20 @@ class LocalProtocolHarness:
                     {
                         "enable": True,
                         "name": "Simulated OPC UA Source",
+                        "connection_id": "conn-simulated-opcua",
+                        "device_id": "device-simulated-opcua",
                         "endpoint_url": self.opcua_source.endpoint,
+                        "poll_interval": self._opcua_poll_interval,
                         "nodes": [
                             {
                                 "enable": True,
                                 "name": "Temperature",
+                                "tag_id": "tag-simulated-temperature",
+                                "connection_id": "conn-simulated-opcua",
+                                "device_id": "device-simulated-opcua",
                                 "node_id": self.opcua_source.node_id.to_string(),
                                 "data_type": "Double",
+                                "subscribe": self._opcua_subscribe,
                             }
                         ],
                     }
@@ -345,3 +438,6 @@ class LocalProtocolHarness:
             [int(point_value.value)],
             target=point_value.point_key,
         )
+
+    def _capture_log(self, message: str, level: str = "INFO") -> None:
+        self.logs.append(f"{level}:{message}")

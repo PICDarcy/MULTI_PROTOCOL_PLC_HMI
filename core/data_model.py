@@ -599,6 +599,7 @@ class CanonicalTag:
     )
     opcua_output: OpcuaOutputMapping = field(default_factory=OpcuaOutputMapping)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    gateway_timestamp: datetime | str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tag_id", TagId(self.tag_id))
@@ -639,6 +640,7 @@ class CanonicalTag:
             "quality": self.quality,
             "source_timestamp": _timestamp_to_json(self.source_timestamp),
             "server_timestamp": _timestamp_to_json(self.server_timestamp),
+            "gateway_timestamp": _timestamp_to_json(self.gateway_timestamp),
             "enabled": self.enabled,
             "modbus_tcp_output": self.modbus_tcp_output.to_dict(),
             "opcua_output": self.opcua_output.to_dict(),
@@ -659,6 +661,7 @@ class CanonicalTag:
             quality=value.get("quality", "Good"),
             source_timestamp=_timestamp_from_json(value.get("source_timestamp")),
             server_timestamp=_timestamp_from_json(value.get("server_timestamp")),
+            gateway_timestamp=_timestamp_from_json(value.get("gateway_timestamp")),
             enabled=value.get("enabled", True),
             modbus_tcp_output=ModbusTcpOutputMapping.from_dict(
                 value.get("modbus_tcp_output")
@@ -701,6 +704,7 @@ class CanonicalTag:
             quality=self.quality,
             source_timestamp=self.source_timestamp,
             server_timestamp=self.server_timestamp,
+            gateway_timestamp=self.gateway_timestamp,
         )
 
 
@@ -799,6 +803,7 @@ class PointValue:
     quality: str = ""
     source_timestamp: datetime | str | None = None
     server_timestamp: datetime | str | None = None
+    gateway_timestamp: datetime | str | None = None
 
     def __post_init__(self) -> None:
         self.point_key = str(self.point_key).strip()
@@ -833,6 +838,8 @@ class PointValue:
             self.source_timestamp = self.timestamp
         if self.server_timestamp is None:
             self.server_timestamp = self.timestamp
+        if self.gateway_timestamp is None:
+            self.gateway_timestamp = self.server_timestamp
 
         if self.value_text is None or (
             self.value_text == "" and self.value is not None
@@ -874,4 +881,5 @@ class PointValue:
             "quality": self.quality,
             "source_timestamp": self.source_timestamp,
             "server_timestamp": self.server_timestamp,
+            "gateway_timestamp": self.gateway_timestamp,
         }

@@ -125,6 +125,8 @@ class LocalProtocolHarnessTests(unittest.TestCase):
             "ProtocolHarness",
             "GatewayModbusTcpServer",
             "GatewayOpcuaOutput",
+            "OpcuaMultiServerLoop",
+            "OpcuaShutdownWaiter",
         )
         return sorted(
             thread.name
