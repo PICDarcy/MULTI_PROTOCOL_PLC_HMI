@@ -17,6 +17,7 @@ from typing import Any
 
 from core.config_manager import ConfigManager
 from core.database_manager import DatabaseManager
+from core.gateway_runtime import GatewayOutputRuntime
 from core.modbus_manager import ModbusRtuManager
 from core.modbus_tcp_manager import ModbusTcpManager
 from core.opcua_manager import OpcuaMultiServerManager
@@ -86,7 +87,7 @@ class App(tk.Tk):
 
     PAGE_SPECS = (
         ("overview", "總覽", "ui.overview_page", "OverviewPage"),
-        ("monitor", "統一監控/讀寫", "ui.monitor_page", "MonitorPage"),
+        ("monitor", "統一監控（唯讀）", "ui.monitor_page", "MonitorPage"),
         ("modbus", "Modbus RTU設定", "ui.modbus_page", "ModbusPage"),
         ("modbus_tcp", "Modbus TCP設定", "ui.modbus_tcp_page", "ModbusTcpPage"),
         (
@@ -169,6 +170,12 @@ class App(tk.Tk):
             "OpcuaMultiServerManager",
             service_dependencies,
         )
+        self.gateway_runtime = self._construct_component(
+            GatewayOutputRuntime,
+            "GatewayOutputRuntime",
+            service_dependencies,
+        )
+        self.gateway_runtime.start()
 
         self.app_context = {
             "config_manager": self.config_manager,
@@ -449,6 +456,7 @@ class App(tk.Tk):
                 ("停止Modbus輪詢", self.modbus_manager.stop_polling),
                 ("停止Modbus TCP輪詢", self.modbus_tcp_manager.stop_polling),
                 ("停止OPC UA服務", opcua_stop_method),
+                ("停止 Gateway 輸出", self.gateway_runtime.stop),
                 ("停止資料庫自動上傳", self.database_manager.stop_auto_write),
             )
             for label, method in cleanup_steps:

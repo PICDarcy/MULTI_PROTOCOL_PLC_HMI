@@ -22,38 +22,12 @@ from urllib.parse import urlsplit, urlunsplit
 from asyncua import Client, ua
 
 from .data_model import PointValue, make_opcua_point_key
+from .gateway_security import ReadonlyGatewayPolicy
 
 
 PROTOCOL_OPCUA = "OPCUA"
 DEFAULT_TIMEOUT_SECONDS = 5.0
 DEFAULT_SUBSCRIPTION_INTERVAL_MS = 500.0
-
-WRITE_TYPES = {
-    "BOOLEAN": ua.VariantType.Boolean,
-    "BYTE": ua.VariantType.Byte,
-    "SBYTE": ua.VariantType.SByte,
-    "INT16": ua.VariantType.Int16,
-    "INT32": ua.VariantType.Int32,
-    "INT64": ua.VariantType.Int64,
-    "UINT16": ua.VariantType.UInt16,
-    "UINT32": ua.VariantType.UInt32,
-    "UINT64": ua.VariantType.UInt64,
-    "FLOAT": ua.VariantType.Float,
-    "DOUBLE": ua.VariantType.Double,
-    "STRING": ua.VariantType.String,
-    "DATETIME": ua.VariantType.DateTime,
-}
-
-INTEGER_LIMITS = {
-    ua.VariantType.SByte: (-(2**7), 2**7 - 1),
-    ua.VariantType.Byte: (0, 2**8 - 1),
-    ua.VariantType.Int16: (-(2**15), 2**15 - 1),
-    ua.VariantType.Int32: (-(2**31), 2**31 - 1),
-    ua.VariantType.Int64: (-(2**63), 2**63 - 1),
-    ua.VariantType.UInt16: (0, 2**16 - 1),
-    ua.VariantType.UInt32: (0, 2**32 - 1),
-    ua.VariantType.UInt64: (0, 2**64 - 1),
-}
 
 SECRET_KEYS = {
     "password",
@@ -98,6 +72,7 @@ class OpcuaMultiServerManager:
         self.config_manager = config_manager
         self.value_bus = value_bus
         self.log_callback = log_callback
+        self._readonly_policy = ReadonlyGatewayPolicy(self._log)
 
         self._state_lock = threading.RLock()
         self._loop_ready = threading.Event()
@@ -149,13 +124,13 @@ class OpcuaMultiServerManager:
         return self._submit(self._read_node(str(server_name), str(node_id)))
 
     def write_node(self, server_name, node_id, value_text, data_type="Auto"):
-        return self._submit(
-            self._write_node(
-                str(server_name),
-                str(node_id),
-                value_text,
-                str(data_type or "Auto"),
-            )
+        self._readonly_policy.reject_write(
+            protocol=PROTOCOL_OPCUA,
+            client="local-api",
+            target=str(server_name),
+            address=str(node_id),
+            request_type="write_node",
+            requested_value=value_text,
         )
 
     def subscribe_node(self, server_name, node_config):
@@ -511,115 +486,6 @@ class OpcuaMultiServerManager:
         except Exception as exc:
             self._record_point_error(server_name, node_id, "讀取", exc)
             raise
-
-    async def _write_node(
-        self,
-        server_name: str,
-        node_id: str,
-        value_text: Any,
-        data_type: str,
-    ) -> dict[str, Any]:
-        client = await self._ensure_connected(server_name)
-        node_id = self._canonical_node_id(node_id)
-        config = self._configured_node_config(server_name, node_id)
-        node = client.get_node(node_id)
-        try:
-            variant_type = await self._resolve_variant_type(node, data_type)
-            converted_value = self._convert_write_value(
-                value_text,
-                variant_type,
-            )
-            await node.write_value(ua.Variant(converted_value, variant_type))
-            data_value = await node.read_data_value()
-            point_value = await self._publish_data_value(
-                server_name,
-                node_id,
-                data_value,
-                config,
-            )
-            self._set_point_status(
-                server_name,
-                node_id,
-                "寫入成功",
-                "",
-                self._now(),
-            )
-            return self._point_to_dict(point_value)
-        except Exception as exc:
-            self._record_point_error(server_name, node_id, "寫入", exc)
-            raise
-
-    async def _resolve_variant_type(self, node, data_type: str):
-        normalized = str(data_type or "Auto").strip().upper()
-        if normalized == "AUTO":
-            return await node.read_data_type_as_variant_type()
-        variant_type = WRITE_TYPES.get(normalized)
-        if variant_type is None:
-            supported = (
-                "Auto、Boolean、Byte、SByte、Int16、Int32、Int64、"
-                "UInt16、UInt32、UInt64、Float、Double、String、DateTime"
-            )
-            raise ValueError(
-                f"不支援的OPC UA寫入型別「{data_type}」，"
-                f"支援型別：{supported}"
-            )
-        return variant_type
-
-    def _convert_write_value(self, value_text: Any, variant_type):
-        if variant_type == ua.VariantType.Boolean:
-            if isinstance(value_text, bool):
-                return value_text
-            text = str(value_text).strip().lower()
-            if text in {
-                "1", "true", "on", "yes", "y", "是", "開", "啟用"
-            }:
-                return True
-            if text in {
-                "0", "false", "off", "no", "n", "否", "關", "停用"
-            }:
-                return False
-            raise ValueError(f"無法將「{value_text}」轉換為Boolean")
-
-        if variant_type in INTEGER_LIMITS:
-            try:
-                value = int(str(value_text).strip(), 0)
-            except ValueError:
-                value = int(str(value_text).strip())
-            minimum, maximum = INTEGER_LIMITS[variant_type]
-            if not minimum <= value <= maximum:
-                raise ValueError(
-                    f"整數{value}超出範圍{minimum}～{maximum}"
-                )
-            return value
-
-        if variant_type in {
-            ua.VariantType.Float,
-            ua.VariantType.Double,
-        }:
-            value = float(value_text)
-            if not math.isfinite(value):
-                raise ValueError("Float或Double不可為NaN或Infinity")
-            return value
-
-        if variant_type == ua.VariantType.String:
-            return str(value_text)
-
-        if variant_type == ua.VariantType.DateTime:
-            if isinstance(value_text, datetime):
-                return value_text
-            text = str(value_text).strip().replace("Z", "+00:00")
-            if not text:
-                raise ValueError("DateTime不可為空白")
-            try:
-                return datetime.fromisoformat(text)
-            except ValueError as exc:
-                raise ValueError(
-                    "DateTime請使用ISO 8601格式，例如2026-07-22T15:30:00+08:00"
-                ) from exc
-
-        raise ValueError(
-            f"Auto解析到目前未支援的寫入型別：{variant_type}"
-        )
 
     # ------------------------------------------------------------------
     # Subscription管理
