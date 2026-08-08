@@ -20,8 +20,9 @@ jobs:
       - name: Verify and unpack patch
         shell: bash
         run: |
-          echo '3114b21bb8746616b7fc7a6273044a9f784fd4f582b1c6f0763a78132693d570  .workspace-patch/issue-14.patch.xz.b64' | sha256sum -c -
-          base64 --decode .workspace-patch/issue-14.patch.xz.b64 | xz --decompress > /tmp/issue-14.patch
+          tr -d '\r\n' < .workspace-patch/issue-14.patch.xz.b64 > /tmp/issue-14.patch.xz.b64
+          echo '3114b21bb8746616b7fc7a6273044a9f784fd4f582b1c6f0763a78132693d570  /tmp/issue-14.patch.xz.b64' | sha256sum -c -
+          base64 --decode /tmp/issue-14.patch.xz.b64 | xz --decompress > /tmp/issue-14.patch
           echo 'f28592688519c1d2ace5969966857c097773265d59dfb4750bc8c453cdf0f15f  /tmp/issue-14.patch' | sha256sum -c -
       - name: Rebuild clean issue commit
         shell: bash
