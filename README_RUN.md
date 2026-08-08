@@ -140,6 +140,19 @@ Copy-Item .\config.example.json .\config.json
 }
 ```
 
+## 6.3 Canonical Tag 映射管理與重新掃描
+
+「Tag 映射管理」頁可修改 Tag 顯示名稱、啟用狀態、Modbus TCP／OPC UA
+個別發布開關、Modbus 位址與 Byte／Word Order，以及 OPC UA 公開名稱。每次
+儲存都會先驗證完整模型，再以原子替換寫入 `config.json`；驗證失敗時不會
+留下部分設定。
+
+- OPC UA 公開 NodeId 固定由 `tag_id` 衍生；修改顯示名稱不會改變 NodeId。
+- 重新掃描以 `point_key` 合併來源，既有 `tag_id` 與使用者映射不變。
+- 消失的來源保留原映射並保存 `source_online=false`，其位址不會分配給新 Tag。
+- 偵測到來源型別改變時，既有 `data_type` 與固定映射先保持不變，並保存
+  `pending_source_data_type`；必須由使用者明確確認且通過位址驗證後才會採用。
+
 ## 7. OPC UA設定重點
 
 - `endpoint_url`格式範例：`opc.tcp://127.0.0.1:4840`。

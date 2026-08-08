@@ -27,6 +27,7 @@ TEST_MODULES = (
     "tests.test_modbus_to_opcua_tracer",
     "tests.test_opcua_output_contract",
     "tests.test_modbus_output_contract",
+    "tests.test_mapping_persistence",
 )
 
 

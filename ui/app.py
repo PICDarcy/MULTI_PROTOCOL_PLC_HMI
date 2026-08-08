@@ -17,6 +17,7 @@ from typing import Any
 
 from core.config_manager import ConfigManager
 from core.database_manager import DatabaseManager
+from core.gateway_mapping_manager import GatewayMappingManager
 from core.gateway_runtime import GatewayOutputRuntime
 from core.modbus_manager import ModbusRtuManager
 from core.modbus_tcp_manager import ModbusTcpManager
@@ -88,6 +89,12 @@ class App(tk.Tk):
     PAGE_SPECS = (
         ("overview", "總覽", "ui.overview_page", "OverviewPage"),
         ("monitor", "統一監控（唯讀）", "ui.monitor_page", "MonitorPage"),
+        (
+            "gateway_mapping",
+            "Tag 映射管理",
+            "ui.gateway_mapping_page",
+            "GatewayMappingPage",
+        ),
         ("modbus", "Modbus RTU設定", "ui.modbus_page", "ModbusPage"),
         ("modbus_tcp", "Modbus TCP設定", "ui.modbus_tcp_page", "ModbusTcpPage"),
         (
@@ -135,6 +142,11 @@ class App(tk.Tk):
             ValueBus,
             "ValueBus",
             {},
+        )
+        self.gateway_mapping_manager = self._construct_component(
+            GatewayMappingManager,
+            "GatewayMappingManager",
+            {"config_manager": self.config_manager},
         )
 
         service_dependencies = {
@@ -184,6 +196,8 @@ class App(tk.Tk):
             "modbus_manager": self.modbus_manager,
             "modbus_tcp_manager": self.modbus_tcp_manager,
             "opcua_manager": self.opcua_manager,
+            "gateway_mapping_manager": self.gateway_mapping_manager,
+            "gateway_runtime": self.gateway_runtime,
             "log_func": self.log_func,
             "refresh_all": self.refresh_all,
             "root": self,

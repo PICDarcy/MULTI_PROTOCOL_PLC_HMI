@@ -644,6 +644,8 @@ class CanonicalTag:
     opcua_output: OpcuaOutputMapping = field(default_factory=OpcuaOutputMapping)
     metadata: Mapping[str, Any] = field(default_factory=dict)
     gateway_timestamp: datetime | str | None = None
+    source_online: bool = True
+    pending_source_data_type: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tag_id", TagId(self.tag_id))
@@ -663,6 +665,21 @@ class CanonicalTag:
         object.__setattr__(self, "data_type", normalize_data_type(self.data_type))
         object.__setattr__(self, "quality", str(self.quality or "Unknown"))
         object.__setattr__(self, "enabled", bool(self.enabled))
+        object.__setattr__(self, "source_online", bool(self.source_online))
+        pending_source_data_type = str(
+            self.pending_source_data_type or ""
+        ).strip()
+        if pending_source_data_type:
+            pending_source_data_type = normalize_data_type(
+                pending_source_data_type
+            )
+            if pending_source_data_type == self.data_type:
+                pending_source_data_type = ""
+        object.__setattr__(
+            self,
+            "pending_source_data_type",
+            pending_source_data_type,
+        )
         if not isinstance(self.modbus_tcp_output, ModbusTcpOutputMapping):
             raise TypeError("modbus_tcp_output型別錯誤")
         mapping = self.modbus_tcp_output
@@ -705,6 +722,11 @@ class CanonicalTag:
             raise TypeError("CanonicalTag.metadata必須是Mapping")
         object.__setattr__(self, "metadata", _freeze_config(self.metadata))
 
+    @property
+    def mapping_confirmation_required(self) -> bool:
+        """來源型別改變後，映射必須由使用者明確確認。"""
+        return bool(self.pending_source_data_type)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "tag_id": self.tag_id,
@@ -720,6 +742,9 @@ class CanonicalTag:
             "server_timestamp": _timestamp_to_json(self.server_timestamp),
             "gateway_timestamp": _timestamp_to_json(self.gateway_timestamp),
             "enabled": self.enabled,
+            "source_online": self.source_online,
+            "pending_source_data_type": self.pending_source_data_type,
+            "mapping_confirmation_required": self.mapping_confirmation_required,
             "modbus_tcp_output": self.modbus_tcp_output.to_dict(),
             "opcua_output": self.opcua_output.to_dict(),
             "metadata": _thaw_config(self.metadata),
@@ -741,6 +766,11 @@ class CanonicalTag:
             server_timestamp=_timestamp_from_json(value.get("server_timestamp")),
             gateway_timestamp=_timestamp_from_json(value.get("gateway_timestamp")),
             enabled=value.get("enabled", True),
+            source_online=value.get("source_online", True),
+            pending_source_data_type=value.get(
+                "pending_source_data_type",
+                "",
+            ),
             modbus_tcp_output=ModbusTcpOutputMapping.from_dict(
                 value.get("modbus_tcp_output")
             ),
