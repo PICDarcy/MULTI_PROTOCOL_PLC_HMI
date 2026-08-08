@@ -1,0 +1,26 @@
+name: Workspace Python 3.11 wheelhouse
+
+on:
+  pull_request:
+    branches:
+      - release/v2.0
+
+permissions:
+  contents: read
+
+jobs:
+  wheelhouse:
+    if: github.head_ref == 'workspace-python311-wheelhouse'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip wheel setuptools
+      - run: python -m pip wheel --wheel-dir wheelhouse -r requirements.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python311-linux-wheelhouse
+          path: wheelhouse
+          retention-days: 1
