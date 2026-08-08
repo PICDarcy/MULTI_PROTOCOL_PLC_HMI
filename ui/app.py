@@ -102,6 +102,12 @@ class App(tk.Tk):
             "ui.opcua_browse_page",
             "OpcuaBrowsePage",
         ),
+        (
+            "gateway_mapping",
+            "Gateway Tag映射",
+            "ui.gateway_mapping_page",
+            "GatewayMappingPage",
+        ),
         ("database", "資料庫設定", "ui.database_page", "DatabasePage"),
     )
 
@@ -184,6 +190,7 @@ class App(tk.Tk):
             "modbus_manager": self.modbus_manager,
             "modbus_tcp_manager": self.modbus_tcp_manager,
             "opcua_manager": self.opcua_manager,
+            "gateway_runtime": self.gateway_runtime,
             "log_func": self.log_func,
             "refresh_all": self.refresh_all,
             "root": self,
