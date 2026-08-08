@@ -111,6 +111,14 @@ class GatewayOutputRuntime:
         with self._lock:
             return self._running
 
+    def reload(self) -> None:
+        """設定保存後重新建立已啟動的兩種輸出與映射。"""
+        with self._lock:
+            was_running = self._running
+        self.stop()
+        if was_running:
+            self.start()
+
     def _start_opcua(self, endpoint: str) -> None:
         self._opcua_ready.clear()
         self._opcua_error = None

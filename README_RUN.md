@@ -140,6 +140,19 @@ Copy-Item .\config.example.json .\config.json
 }
 ```
 
+## 6.3 Gateway Tag映射與重新掃描
+
+左側選單的「Gateway Tag映射」頁集中管理每個Canonical Tag的雙輸出設定：
+
+- 可修改Tag顯示名稱、啟用狀態、Modbus TCP與OPC UA的個別發布開關。
+- Modbus輸出可修改固定起始位址、Byte Order與Word Order；位址留白時使用第一段足夠的連續未占用空間。
+- OPC UA可修改公開Browse Name；實際Variable NodeId仍由穩定`tag_id`衍生，不會因改名而改變。
+- 所有修改先驗證完整模型，再以原子檔案替換保存；重疊、越界或空間不足時，記憶體與設定檔都保持原狀。
+- 重新掃描以穩定`point_key`合併。既有Tag保留使用者名稱與雙輸出映射；新Tag只使用未占用空間。
+- 掃描不到的Tag會標示`offline`並停用，但原位址仍保留，不會自動交給新Tag。
+- 來源型別改變時會標示`pending_type_change`並停用；確認回到原型別前，不會在固定位置靜默改變暫存器寬度。
+- 保存成功後，若Gateway輸出正在執行，系統會停止並以新設定重新建立兩種輸出。
+
 ## 7. OPC UA設定重點
 
 - `endpoint_url`格式範例：`opc.tcp://127.0.0.1:4840`。
