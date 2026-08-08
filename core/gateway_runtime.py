@@ -11,6 +11,7 @@ from asyncua import ua
 
 from .gateway_modbus_adapter import GatewayModbusOutputAdapter
 from .gateway_modbus_server import GatewayModbusTcpServer
+from .gateway_opcua_adapter import GatewayOpcuaOutputAdapter
 from .gateway_opcua_server import GatewayOpcuaServer
 
 
@@ -24,6 +25,7 @@ class GatewayOutputRuntime:
         self.modbus_server: GatewayModbusTcpServer | None = None
         self.modbus_adapter: GatewayModbusOutputAdapter | None = None
         self.opcua_server: GatewayOpcuaServer | None = None
+        self.opcua_adapter: GatewayOpcuaOutputAdapter | None = None
         self.opcua_system_node_id: ua.NodeId | None = None
         self._opcua_loop: asyncio.AbstractEventLoop | None = None
         self._opcua_thread: threading.Thread | None = None
@@ -79,17 +81,24 @@ class GatewayOutputRuntime:
 
     def stop(self) -> None:
         with self._lock:
-            if not self._running and self.modbus_server is None and self.opcua_server is None:
+            if (
+                not self._running
+                and self.modbus_server is None
+                and self.opcua_server is None
+            ):
                 return
             self._running = False
             modbus_adapter, self.modbus_adapter = self.modbus_adapter, None
             modbus, self.modbus_server = self.modbus_server, None
+            opcua_adapter, self.opcua_adapter = self.opcua_adapter, None
             loop = self._opcua_loop
             thread, self._opcua_thread = self._opcua_thread, None
         if modbus_adapter is not None:
             modbus_adapter.stop()
         if modbus is not None:
             modbus.stop()
+        if opcua_adapter is not None:
+            opcua_adapter.stop()
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
@@ -118,7 +127,9 @@ class GatewayOutputRuntime:
         if not self._opcua_ready.wait(timeout=10):
             raise RuntimeError("OPC UA 輸出 Server 啟動逾時")
         if self._opcua_error is not None:
-            raise RuntimeError("OPC UA 輸出 Server 啟動失敗") from self._opcua_error
+            raise RuntimeError(
+                "OPC UA 輸出 Server 啟動失敗"
+            ) from self._opcua_error
 
     def _opcua_worker(self) -> None:
         loop = asyncio.new_event_loop()
@@ -150,6 +161,15 @@ class GatewayOutputRuntime:
             value=True,
             variant_type=ua.VariantType.Boolean,
         )
+        if self.value_bus is not None:
+            self.opcua_adapter = GatewayOpcuaOutputAdapter(
+                self.config_manager,
+                self.value_bus,
+                self.opcua_server,
+                asyncio.get_running_loop(),
+                self.log_callback,
+            )
+            await self.opcua_adapter.start()
 
     def _config_snapshot(self) -> dict[str, Any]:
         getter = getattr(self.config_manager, "get_section", None)
