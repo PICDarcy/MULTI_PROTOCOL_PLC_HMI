@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
-from .data_model import GatewayModel
+from .data_model import GatewayModel, allocate_modbus_output_addresses
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -51,6 +51,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enable": False,
             "host": "127.0.0.1",
             "port": 1502,
+            "coil_start": 0,
+            "coil_end": 65535,
+            "register_start": 0,
+            "register_end": 65535,
         },
         "opcua_server": {
             "enable": False,
@@ -251,7 +255,9 @@ class ConfigManager:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
 
             if not self.config_path.exists():
-                self.config = copy.deepcopy(self._default_config)
+                self.config = self._prepare_config_for_save(
+                    copy.deepcopy(self._default_config)
+                )
                 self.require_enabled_credentials()
                 self.save_config()
                 return self.get_config()
@@ -263,25 +269,31 @@ class ConfigManager:
                     raise ValueError("config.json根節點必須是JSON物件")
             except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
                 self._backup_invalid_config()
-                self.config = copy.deepcopy(self._default_config)
+                self.config = self._prepare_config_for_save(
+                    copy.deepcopy(self._default_config)
+                )
                 self.require_enabled_credentials()
                 self.save_config()
                 return self.get_config()
 
-            self.config = self.deep_merge(self._default_config, loaded)
+            self.config = self._prepare_config_for_save(
+                self.deep_merge(self._default_config, loaded)
+            )
             self.require_enabled_credentials()
             return self.get_config()
 
     def save_config(self, config: Mapping[str, Any] | None = None) -> bool:
-        """以UTF-8及原子替換方式儲存完整設定。"""
+        """驗證完整模型後，以UTF-8及原子替換方式儲存設定。"""
         with self._lock:
-            if config is not None:
-                if not isinstance(config, Mapping):
-                    raise TypeError("config必須是Mapping")
-                self.config = self.deep_merge(self._default_config, config)
+            if config is not None and not isinstance(config, Mapping):
+                raise TypeError("config必須是Mapping")
 
-            if not self.config:
-                self.config = copy.deepcopy(self._default_config)
+            source = config if config is not None else self.config
+            if not source:
+                source = self._default_config
+            candidate = self._prepare_config_for_save(
+                self.deep_merge(self._default_config, source)
+            )
 
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
             temporary_path: str | None = None
@@ -297,7 +309,7 @@ class ConfigManager:
                 ) as temporary_file:
                     temporary_path = temporary_file.name
                     json.dump(
-                        self.config,
+                        candidate,
                         temporary_file,
                         ensure_ascii=False,
                         indent=2,
@@ -308,10 +320,38 @@ class ConfigManager:
 
                 os.replace(temporary_path, self.config_path)
                 temporary_path = None
+                self.config = candidate
                 return True
             finally:
                 if temporary_path and os.path.exists(temporary_path):
                     os.remove(temporary_path)
+
+    def _prepare_config_for_save(
+        self,
+        config: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """驗證／配置 Gateway 映射並回傳不修改輸入的完整副本。"""
+        candidate = copy.deepcopy(dict(config))
+        model = GatewayModel.from_dict(candidate.get("gateway_model", {}))
+        outputs = candidate.get("gateway_outputs", {})
+        if not isinstance(outputs, Mapping):
+            outputs = {}
+        server = outputs.get("modbus_tcp_server", {})
+        if not isinstance(server, Mapping):
+            server = {}
+        allocated_tags = allocate_modbus_output_addresses(
+            model.tags,
+            coil_start=server.get("coil_start", 0),
+            coil_end=server.get("coil_end", 65535),
+            register_start=server.get("register_start", 0),
+            register_end=server.get("register_end", 65535),
+        )
+        candidate["gateway_model"] = GatewayModel(
+            connections=model.connections,
+            devices=model.devices,
+            tags=allocated_tags,
+        ).to_dict()
+        return candidate
 
     def get_config(self) -> dict[str, Any]:
         """取得完整設定的深層副本。"""
@@ -358,13 +398,16 @@ class ConfigManager:
             if not isinstance(current, Mapping):
                 current = {}
             updated = self.deep_merge(current, data)
-            self.config[section_name] = updated
-            self.save_config()
+            candidate = copy.deepcopy(self.config)
+            candidate[section_name] = updated
+            self.save_config(candidate)
             return copy.deepcopy(updated)
 
     def get_gateway_model(self) -> GatewayModel:
-        """將 canonical 設定反序列化為一致性模型。"""
-        return GatewayModel.from_dict(self.get_section("gateway_model", {}))
+        """將 canonical 設定驗證、配置後反序列化為一致性模型。"""
+        with self._lock:
+            prepared = self._prepare_config_for_save(self.config)
+        return GatewayModel.from_dict(prepared.get("gateway_model", {}))
 
     def set_gateway_model(self, model: GatewayModel) -> None:
         """保存 canonical 模型；實際寫檔仍由既有 save_config 控制。"""

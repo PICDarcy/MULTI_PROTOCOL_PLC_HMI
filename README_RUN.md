@@ -111,6 +111,35 @@ Copy-Item .\config.example.json .\config.json
 - `address`使用PDU位址，通常從0開始。請依PLC或設備手冊確認是否需要將文件中的40001、30001等位址換算為0起始位址。
 - `writable`只表示HMI是否允許寫入；實際是否能寫仍取決於點位類型與設備權限。
 
+## 6.2 唯讀Gateway Modbus TCP輸出設定
+
+`gateway_outputs.modbus_tcp_server`控制上位系統讀取的唯讀Modbus TCP Server：
+
+- `coil_start`／`coil_end`：Boolean自動映射可使用的0-based Coil範圍。
+- `register_start`／`register_end`：數值Tag自動映射可使用的0-based Holding Register範圍。
+- `Byte`、`SByte`、`Int16`、`UInt16`占用1個Register。
+- `Int32`、`UInt32`、`Float`占用2個連續Register。
+- `Int64`、`UInt64`、`Double`占用4個連續Register。
+- 預設`byte_order=big`、`word_order=big`（High Word First）；每個Tag可改為`little`。
+- `String`、陣列、`Structure`、`ByteString`及其他可變長度型別不支援Modbus自動映射。設定載入後會保留`enabled=false`，並在`unsupported_reason`標示原因。
+- 位址重疊、超出0至65535、或找不到足夠連續空間時，設定不會寫入磁碟，錯誤訊息會列出Tag與衝突範圍。
+- Boolean只能映射至Coil；數值型別只能映射至Holding Register。Gateway不做跨型別轉換。
+
+每個Canonical Tag的`modbus_tcp_output`可使用以下欄位：
+
+```json
+{
+  "enabled": true,
+  "area": "holding_register",
+  "address": null,
+  "byte_order": "big",
+  "word_order": "big",
+  "auto_allocate": true,
+  "supported": true,
+  "unsupported_reason": ""
+}
+```
+
 ## 7. OPC UA設定重點
 
 - `endpoint_url`格式範例：`opc.tcp://127.0.0.1:4840`。
