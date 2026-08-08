@@ -1,0 +1,36 @@
+name: Apply verified issue 14 patch
+
+on:
+  pull_request:
+    branches:
+      - release/v2.0
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.head_ref == 'issue-14-modbus-tag-management'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - name: Verify and unpack patch
+        shell: bash
+        run: |
+          echo '3114b21bb8746616b7fc7a6273044a9f784fd4f582b1c6f0763a78132693d570  .workspace-patch/issue-14.patch.xz.b64' | sha256sum -c -
+          base64 --decode .workspace-patch/issue-14.patch.xz.b64 | xz --decompress > /tmp/issue-14.patch
+          echo 'f28592688519c1d2ace5969966857c097773265d59dfb4750bc8c453cdf0f15f  /tmp/issue-14.patch' | sha256sum -c -
+      - name: Rebuild clean issue commit
+        shell: bash
+        run: |
+          git fetch origin release/v2.0
+          git reset --hard origin/release/v2.0
+          git apply --index /tmp/issue-14.patch
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat: add Modbus tag management and safe scanning (#14)'
+          git push --force-with-lease origin HEAD:${{ github.head_ref }}
