@@ -155,6 +155,7 @@ class LocalProtocolHarness:
         opcua_subscribe: bool = True,
         opcua_poll_interval: float = 0.1,
         modbus_points: list[dict[str, Any]] | None = None,
+        gateway_model: dict[str, Any] | None = None,
         auto_start_opcua_collection: bool = False,
     ) -> None:
         self._requested_ports = {
@@ -167,6 +168,7 @@ class LocalProtocolHarness:
         self._opcua_subscribe = bool(opcua_subscribe)
         self._opcua_poll_interval = float(opcua_poll_interval)
         self._modbus_points = copy.deepcopy(modbus_points)
+        self._gateway_model = copy.deepcopy(gateway_model)
         self._auto_start_opcua_collection = bool(auto_start_opcua_collection)
         self._config_path: Path | None = None
         self.config_manager: ConfigManager | None = None
@@ -205,6 +207,13 @@ class LocalProtocolHarness:
         if runtime is None or runtime.modbus_server is None:
             raise RuntimeError("Gateway Modbus輸出尚未啟動")
         return runtime.modbus_server.port
+
+    @property
+    def gateway_opcua_endpoint(self) -> str:
+        runtime = self.gateway_runtime
+        if runtime is None or runtime.opcua_server is None:
+            raise RuntimeError("Gateway OPC UA輸出尚未啟動")
+        return f"opc.tcp://127.0.0.1:{runtime.opcua_server.port}"
 
     @property
     def opcua_source_endpoint(self) -> str:
@@ -438,7 +447,7 @@ class LocalProtocolHarness:
             return await node.read_value()
 
     def _configuration(self) -> dict[str, Any]:
-        return {
+        configuration = {
             "opcua": {
                 "enable": True,
                 "servers": [
@@ -588,6 +597,9 @@ class LocalProtocolHarness:
                 ],
             },
         }
+        if self._gateway_model is not None:
+            configuration["gateway_model"] = copy.deepcopy(self._gateway_model)
+        return configuration
 
     def _bridge_modbus_value(self, point_value) -> None:
         runtime = self.gateway_runtime

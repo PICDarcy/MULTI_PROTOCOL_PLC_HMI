@@ -90,6 +90,7 @@ class GatewayOpcuaServer:
         self._namespace_index: int | None = None
         self._started = False
         self._original_write = None
+        self._nodes: dict[str, Any] = {}
 
     @property
     def port(self) -> int:
@@ -132,14 +133,54 @@ class GatewayOpcuaServer:
     ) -> ua.NodeId:
         if not self._started or self._namespace_index is None:
             raise RuntimeError("OPC UA Gateway Server 尚未啟動")
-        node_id = ua.NodeId(str(tag_id), self._namespace_index)
+        key = str(tag_id)
+        existing = self._nodes.get(key)
+        if existing is not None:
+            return existing.nodeid
+        node_id = ua.NodeId(key, self._namespace_index)
         node = await self._server.nodes.objects.add_variable(
             node_id,
             ua.QualifiedName(str(display_name), self._namespace_index),
             value,
             variant_type,
         )
+        self._nodes[key] = node
         return node.nodeid
+
+    async def publish_value(
+        self,
+        *,
+        tag_id: str,
+        value: Any,
+        variant_type: ua.VariantType,
+        source_timestamp=None,
+        server_timestamp=None,
+    ) -> None:
+        """透過保存的原始 AttributeService 更新唯讀節點。"""
+        if not self._started or self._original_write is None:
+            raise RuntimeError("OPC UA Gateway Server 尚未啟動")
+        node = self._nodes.get(str(tag_id))
+        if node is None:
+            raise KeyError(f"OPC UA輸出節點不存在：{tag_id}")
+        data_value = ua.DataValue(
+            Value=ua.Variant(value, variant_type),
+            StatusCode_=ua.StatusCode(ua.StatusCodes.Good),
+            SourceTimestamp=source_timestamp,
+            ServerTimestamp=server_timestamp,
+        )
+        params = ua.WriteParameters(
+            NodesToWrite=[
+                ua.WriteValue(
+                    NodeId_=node.nodeid,
+                    AttributeId=ua.AttributeIds.Value,
+                    Value=data_value,
+                )
+            ]
+        )
+        results = await self._original_write(params)
+        if not results:
+            raise RuntimeError(f"OPC UA輸出節點更新無回應：{tag_id}")
+        results[0].check()
 
     def _install_readonly_write_service(self) -> None:
         service = self._server.iserver.attribute_service
