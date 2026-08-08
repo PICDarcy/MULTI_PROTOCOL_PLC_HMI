@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Any
 
-from .data_model import GatewayModel, PointValue, normalize_data_type
+from .data_model import (
+    GatewayModel,
+    PointValue,
+    allocate_modbus_output_addresses,
+    normalize_data_type,
+)
+from .modbus_codec import encode_modbus_value
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +20,8 @@ class _OutputBinding:
     area: str
     address: int
     data_type: str
+    byte_order: str
+    word_order: str
 
 
 class GatewayModbusOutputAdapter:
@@ -42,14 +49,26 @@ class GatewayModbusOutputAdapter:
         if callable(getter):
             model = getter()
             if isinstance(model, GatewayModel):
-                return model
+                allocated_tags = allocate_modbus_output_addresses(model.tags)
+                if allocated_tags == model.tags:
+                    return model
+                return GatewayModel(
+                    connections=model.connections,
+                    devices=model.devices,
+                    tags=allocated_tags,
+                )
         section_getter = getattr(self.config_manager, "get_section", None)
         value = (
             section_getter("gateway_model", {})
             if callable(section_getter)
             else {}
         )
-        return GatewayModel.from_dict(value)
+        model = GatewayModel.from_dict(value)
+        return GatewayModel(
+            connections=model.connections,
+            devices=model.devices,
+            tags=allocate_modbus_output_addresses(model.tags),
+        )
 
     def reload_mappings(self) -> int:
         bindings: dict[str, _OutputBinding] = {}
@@ -62,6 +81,8 @@ class GatewayModbusOutputAdapter:
                 area=mapping.area,
                 address=int(mapping.address),
                 data_type=normalize_data_type(tag.data_type),
+                byte_order=mapping.byte_order,
+                word_order=mapping.word_order,
             )
         with self._lock:
             self._bindings = bindings
@@ -114,7 +135,9 @@ class GatewayModbusOutputAdapter:
             )
             return
         try:
-            if binding.data_type == "Boolean" and binding.area == "coil":
+            if binding.data_type == "Boolean":
+                if binding.area != "coil":
+                    raise ValueError("Boolean mapping必須使用Coil")
                 if not isinstance(point_value.value, bool):
                     raise TypeError("Boolean mapping只接受bool值")
                 self.server.set_coils(
@@ -123,22 +146,20 @@ class GatewayModbusOutputAdapter:
                     target=binding.tag_id,
                 )
                 return
-            if binding.data_type == "UInt16" and binding.area == "holding_register":
-                value: Any = point_value.value
-                if isinstance(value, bool) or not isinstance(value, int):
-                    raise TypeError("UInt16 mapping只接受整數值")
-                if not 0 <= value <= 0xFFFF:
-                    raise ValueError("UInt16 mapping值必須介於0到65535")
-                self.server.set_holding_registers(
-                    binding.address,
-                    [value],
-                    target=binding.tag_id,
+            if binding.area != "holding_register":
+                raise ValueError(
+                    f"{binding.data_type} mapping必須使用Holding Register"
                 )
-                return
-            self._log(
-                f"Modbus輸出略過Tag「{binding.tag_id}」：#9 tracer只支援"
-                "Boolean→Coil與UInt16→Holding Register",
-                "WARNING",
+            registers = encode_modbus_value(
+                point_value.value,
+                binding.data_type,
+                byte_order=binding.byte_order,
+                word_order=binding.word_order,
+            )
+            self.server.set_holding_registers(
+                binding.address,
+                registers,
+                target=binding.tag_id,
             )
         except (TypeError, ValueError) as exc:
             self._log(

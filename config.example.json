@@ -161,7 +161,11 @@
     "modbus_tcp_server": {
       "enable": false,
       "host": "127.0.0.1",
-      "port": 1502
+      "port": 1502,
+      "coil_start": 0,
+      "coil_end": 65535,
+      "register_start": 0,
+      "register_end": 65535
     },
     "opcua_server": {
       "enable": false,

@@ -13,6 +13,8 @@ from typing import Any, Callable
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from core.modbus_codec import modbus_output_description
+
 
 class OpcuaBrowsePage(ttk.Frame):
     """提供多台OPC UA Server的節點瀏覽、掃描與監控設定功能。
@@ -30,6 +32,7 @@ class OpcuaBrowsePage(ttk.Frame):
         "node_id",
         "node_class",
         "data_type",
+        "modbus_output",
         "path",
     )
 
@@ -160,6 +163,7 @@ class OpcuaBrowsePage(ttk.Frame):
             "node_id": "NodeId",
             "node_class": "Node Class",
             "data_type": "Data Type",
+            "modbus_output": "Modbus輸出",
             "path": "Path",
         }
         widths = {
@@ -168,6 +172,7 @@ class OpcuaBrowsePage(ttk.Frame):
             "node_id": 230,
             "node_class": 100,
             "data_type": 130,
+            "modbus_output": 190,
             "path": 320,
         }
         for column in self.TREE_COLUMNS:
@@ -557,6 +562,9 @@ class OpcuaBrowsePage(ttk.Frame):
                     "node_id": str(node_id),
                     "node_class": str(node_class or ""),
                     "data_type": str(data_type or ""),
+                    "modbus_output": modbus_output_description(
+                        data_type or "Auto"
+                    ),
                     "path": str(path or parent_path),
                 }
             )

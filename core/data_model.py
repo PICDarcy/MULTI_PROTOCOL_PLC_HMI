@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Mapping
 from urllib.parse import quote, unquote
+
+from .modbus_codec import (
+    is_modbus_output_scalar_type,
+    modbus_output_register_count,
+    normalize_modbus_order,
+)
 
 
 SUPPORTED_PROTOCOLS = frozenset({"MODBUS_RTU", "MODBUS_TCP", "OPCUA"})
@@ -510,6 +516,11 @@ class ModbusTcpOutputMapping:
     enabled: bool = False
     area: str | None = None
     address: int | None = None
+    byte_order: str = "big"
+    word_order: str = "big"
+    auto_allocate: bool = False
+    supported: bool = True
+    unsupported_reason: str = ""
     _area_was_default: bool = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -520,8 +531,28 @@ class ModbusTcpOutputMapping:
         object.__setattr__(self, "area", area)
         object.__setattr__(self, "_area_was_default", area_was_default)
         object.__setattr__(self, "enabled", bool(self.enabled))
-        if self.enabled and self.address is None:
-            raise ValueError("啟用Modbus TCP輸出時address不可為空")
+        object.__setattr__(self, "auto_allocate", bool(self.auto_allocate))
+        object.__setattr__(self, "supported", bool(self.supported))
+        object.__setattr__(
+            self,
+            "unsupported_reason",
+            str(self.unsupported_reason or "").strip(),
+        )
+        object.__setattr__(
+            self,
+            "byte_order",
+            normalize_modbus_order(self.byte_order, kind="byte"),
+        )
+        object.__setattr__(
+            self,
+            "word_order",
+            normalize_modbus_order(self.word_order, kind="word"),
+        )
+        if self.enabled and self.address is None and not self.auto_allocate:
+            raise ValueError(
+                "啟用Modbus TCP輸出時address不可為空，"
+                "除非啟用auto_allocate"
+            )
         if self.address is not None:
             address = int(self.address)
             if not 0 <= address <= 65535:
@@ -533,6 +564,11 @@ class ModbusTcpOutputMapping:
             "enabled": self.enabled,
             "area": self.area,
             "address": self.address,
+            "byte_order": self.byte_order,
+            "word_order": self.word_order,
+            "auto_allocate": self.auto_allocate,
+            "supported": self.supported,
+            "unsupported_reason": self.unsupported_reason,
         }
 
     @classmethod
@@ -542,6 +578,11 @@ class ModbusTcpOutputMapping:
             enabled=data.get("enabled", False),
             area=data.get("area"),
             address=data.get("address"),
+            byte_order=data.get("byte_order", "big"),
+            word_order=data.get("word_order", "big"),
+            auto_allocate=data.get("auto_allocate", False),
+            supported=data.get("supported", True),
+            unsupported_reason=data.get("unsupported_reason", ""),
         )
 
 
@@ -624,19 +665,40 @@ class CanonicalTag:
         object.__setattr__(self, "enabled", bool(self.enabled))
         if not isinstance(self.modbus_tcp_output, ModbusTcpOutputMapping):
             raise TypeError("modbus_tcp_output型別錯誤")
-        if (
-            self.data_type == "Boolean"
-            and self.modbus_tcp_output._area_was_default
-        ):
-            object.__setattr__(
-                self,
-                "modbus_tcp_output",
-                ModbusTcpOutputMapping(
-                    enabled=self.modbus_tcp_output.enabled,
-                    area="coil",
-                    address=self.modbus_tcp_output.address,
-                ),
+        mapping = self.modbus_tcp_output
+        if not is_modbus_output_scalar_type(self.data_type):
+            reason = f"{self.data_type}不支援Modbus TCP自動映射"
+            if mapping.enabled:
+                raise ValueError(
+                    f"{self.data_type}不支援Modbus TCP輸出；"
+                    "String、Array、Structure、ByteString與其他可變長度型別"
+                    "不得啟用映射"
+                )
+            mapping = replace(
+                mapping,
+                enabled=False,
+                address=None,
+                auto_allocate=False,
+                supported=False,
+                unsupported_reason=reason,
             )
+        else:
+            required_area = (
+                "coil" if self.data_type == "Boolean" else "holding_register"
+            )
+            if mapping._area_was_default:
+                mapping = replace(mapping, area=required_area)
+            elif mapping.area != required_area:
+                raise ValueError(
+                    f"{self.data_type}不允許映射至{mapping.area}；"
+                    f"必須使用{required_area}且不得跨型別轉換"
+                )
+            mapping = replace(
+                mapping,
+                supported=True,
+                unsupported_reason="",
+            )
+        object.__setattr__(self, "modbus_tcp_output", mapping)
         if not isinstance(self.opcua_output, OpcuaOutputMapping):
             raise TypeError("opcua_output型別錯誤")
         if not isinstance(self.metadata, Mapping):
@@ -724,6 +786,115 @@ class CanonicalTag:
         )
 
 
+def _modbus_output_width(tag: CanonicalTag) -> int:
+    if tag.data_type == "Boolean":
+        return 1
+    return modbus_output_register_count(tag.data_type)
+
+
+def allocate_modbus_output_addresses(
+    tags: tuple[CanonicalTag, ...] | list[CanonicalTag],
+    *,
+    coil_start: int = 0,
+    coil_end: int = 65535,
+    register_start: int = 0,
+    register_end: int = 65535,
+    allocate_auto: bool = True,
+) -> tuple[CanonicalTag, ...]:
+    """驗證固定映射並為 auto mapping 配置第一段連續空間。
+
+    範圍端點皆為 0-based 且包含端點。已有固定地址即使 Tag 目前停用，
+    仍視為保留，避免自動配置破壞既有上位系統地址契約。
+    """
+
+    limits = {
+        "coil": (int(coil_start), int(coil_end)),
+        "holding_register": (int(register_start), int(register_end)),
+    }
+    for area, (start, end) in limits.items():
+        if not 0 <= start <= end <= 65535:
+            raise ValueError(
+                f"{area}輸出範圍必須介於0到65535且起點不可大於終點"
+            )
+
+    result = list(tags)
+    occupied: dict[str, list[tuple[int, int, str]]] = {
+        "coil": [],
+        "holding_register": [],
+    }
+
+    def reserve(tag: CanonicalTag, start: int) -> None:
+        mapping = tag.modbus_tcp_output
+        area = mapping.area
+        width = _modbus_output_width(tag)
+        end = start + width - 1
+        allowed_start, allowed_end = limits[area]
+        if start < allowed_start or end > allowed_end:
+            raise ValueError(
+                f"Tag「{tag.tag_id}」Modbus TCP輸出範圍{start}-{end}"
+                f"超出允許範圍{allowed_start}-{allowed_end}"
+            )
+        for other_start, other_end, other_tag_id in occupied[area]:
+            if start <= other_end and other_start <= end:
+                raise ValueError(
+                    f"Tag「{other_tag_id}」與Tag「{tag.tag_id}」"
+                    f"Modbus TCP輸出位址重疊："
+                    f"{other_start}-{other_end}與{start}-{end}"
+                )
+        occupied[area].append((start, end, str(tag.tag_id)))
+        occupied[area].sort(key=lambda item: (item[0], item[1], item[2]))
+
+    # 先保留所有明確地址，再為尚未配置的 enabled auto mapping 找空間。
+    for tag in result:
+        mapping = tag.modbus_tcp_output
+        if not mapping.supported or mapping.address is None:
+            continue
+        reserve(tag, mapping.address)
+
+    if not allocate_auto:
+        return tuple(result)
+
+    for index, tag in enumerate(result):
+        mapping = tag.modbus_tcp_output
+        if (
+            not tag.enabled
+            or not mapping.enabled
+            or not mapping.supported
+            or mapping.address is not None
+            or not mapping.auto_allocate
+        ):
+            continue
+        area = mapping.area
+        width = _modbus_output_width(tag)
+        candidate, allowed_end = limits[area]
+        while candidate + width - 1 <= allowed_end:
+            candidate_end = candidate + width - 1
+            conflict = next(
+                (
+                    (start, end)
+                    for start, end, _tag_id in occupied[area]
+                    if candidate <= end and start <= candidate_end
+                ),
+                None,
+            )
+            if conflict is None:
+                break
+            candidate = conflict[1] + 1
+        else:
+            allowed_start, allowed_end = limits[area]
+            raise ValueError(
+                f"Tag「{tag.tag_id}」找不到{width}個連續空間；"
+                f"{area}允許範圍為{allowed_start}-{allowed_end}"
+            )
+
+        allocated_mapping = replace(mapping, address=candidate)
+        allocated_tag = replace(tag, modbus_tcp_output=allocated_mapping)
+        result[index] = allocated_tag
+        reserve(allocated_tag, candidate)
+
+    return tuple(result)
+
+
 @dataclass(frozen=True, slots=True)
 class GatewayModel:
     """Connection、Device 與 Tag 的一致性邊界。"""
@@ -758,6 +929,14 @@ class GatewayModel:
             device = next(item for item in self.devices if item.device_id == tag.device_id)
             if device.connection_id != tag.connection_id:
                 raise ValueError("CanonicalTag的connection_id與Device不一致")
+        object.__setattr__(
+            self,
+            "tags",
+            allocate_modbus_output_addresses(
+                self.tags,
+                allocate_auto=False,
+            ),
+        )
 
     @staticmethod
     def _unique_ids(items: tuple[Any, ...], field_name: str) -> set[str]:
