@@ -46,7 +46,10 @@ class _RecordingOpcuaServer:
         display_name,
         value,
         variant_type,
+        device_id="",
+        device_name="",
     ):
+        del device_id, device_name
         self.nodes[str(tag_id)] = (display_name, value, variant_type)
         self.values[str(tag_id)] = value
         return ua.NodeId(str(tag_id), 2)
@@ -57,10 +60,11 @@ class _RecordingOpcuaServer:
         tag_id,
         value,
         variant_type,
+        quality="Good",
         source_timestamp=None,
         server_timestamp=None,
     ) -> None:
-        del variant_type, source_timestamp, server_timestamp
+        del variant_type, quality, source_timestamp, server_timestamp
         if value == 1:
             await asyncio.sleep(0.05)
         self.values[str(tag_id)] = value
